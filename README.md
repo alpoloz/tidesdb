@@ -32,10 +32,19 @@ import (
 	"log"
 
 	"tidesdb"
+	"go.uber.org/zap"
 )
 
 func main() {
-	db, err := tidesdb.Open("data", nil)
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		_ = logger.Sync()
+	}()
+
+	db, err := tidesdb.Open("data", logger, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -67,10 +76,19 @@ import (
 	"log"
 
 	"tidesdb"
+	"go.uber.org/zap"
 )
 
 func main() {
-	db, err := tidesdb.Open("data", nil)
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		_ = logger.Sync()
+	}()
+
+	db, err := tidesdb.Open("data", logger, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -79,7 +97,7 @@ func main() {
 	}
 	_ = db.Close()
 
-	db, err = tidesdb.Open("data", nil)
+	db, err = tidesdb.Open("data", logger, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -96,11 +114,19 @@ func main() {
 ### Custom options
 
 ```go
+logger, err := zap.NewDevelopment()
+if err != nil {
+	log.Fatal(err)
+}
+defer func() {
+	_ = logger.Sync()
+}()
+
 opts := &tidesdb.Options{
 	MemtableMaxBytes: 1 << 20,
 	MaxSSTables:      2,
 }
-db, err := tidesdb.Open("data", opts)
+db, err := tidesdb.Open("data", logger, opts)
 if err != nil {
 	log.Fatal(err)
 }

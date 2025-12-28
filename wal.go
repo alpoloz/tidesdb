@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
+
+	"go.uber.org/zap"
 )
 
 type walOp byte
@@ -21,11 +23,15 @@ type walRecord struct {
 }
 
 type wal struct {
-	file *os.File
-	buf  *bufio.Writer
+	file   *os.File
+	buf    *bufio.Writer
+	logger *zap.Logger
 }
 
-func openWAL(path string) (*wal, error) {
+func openWAL(path string, logger *zap.Logger) (*wal, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
@@ -34,7 +40,8 @@ func openWAL(path string) (*wal, error) {
 		_ = file.Close()
 		return nil, err
 	}
-	return &wal{file: file, buf: bufio.NewWriter(file)}, nil
+	logger.Info("wal opened", zap.String("path", path))
+	return &wal{file: file, buf: bufio.NewWriter(file), logger: logger}, nil
 }
 
 func (w *wal) appendRecord(op walOp, key string, value []byte) error {

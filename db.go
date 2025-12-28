@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"go.uber.org/zap"
 )
 
 const (
@@ -36,11 +38,15 @@ type DB struct {
 	wal       *wal
 	sstables  []*sstable
 	nextSSTID uint64
+	logger    *zap.Logger
 }
 
-func Open(path string, opts *Options) (*DB, error) {
+func Open(path string, logger *zap.Logger, opts *Options) (*DB, error) {
 	if path == "" {
 		return nil, errors.New("path required")
+	}
+	if logger == nil {
+		logger = zap.NewNop()
 	}
 	options := Options{
 		MemtableMaxBytes: defaultMemtableMaxBytes,
@@ -59,7 +65,7 @@ func Open(path string, opts *Options) (*DB, error) {
 		return nil, err
 	}
 
-	w, err := openWAL(filepath.Join(path, "wal.log"))
+	w, err := openWAL(filepath.Join(path, "wal.log"), logger)
 	if err != nil {
 		return nil, err
 	}
@@ -69,6 +75,7 @@ func Open(path string, opts *Options) (*DB, error) {
 		opts:     options,
 		memtable: make(map[string]entry),
 		wal:      w,
+		logger:   logger,
 	}
 
 	if err := db.loadSSTables(); err != nil {
@@ -79,6 +86,12 @@ func Open(path string, opts *Options) (*DB, error) {
 		_ = w.Close()
 		return nil, err
 	}
+
+	db.logger.Info("db opened",
+		zap.String("path", path),
+		zap.Int("sstables", len(db.sstables)),
+		zap.Int("memtable_entries", len(db.memtable)),
+	)
 
 	return db, nil
 }
@@ -189,7 +202,13 @@ func (db *DB) flushLocked() error {
 	id := db.nextSSTID
 	db.nextSSTID++
 
-	sst, err := createSSTable(db.path, id, keys, db.memtable)
+	db.logger.Info("flushing memtable",
+		zap.Uint64("sstable_id", id),
+		zap.Int("entries", len(keys)),
+		zap.Int("mem_bytes", db.memBytes),
+	)
+
+	sst, err := createSSTable(db.path, id, keys, db.memtable, db.logger)
 	if err != nil {
 		return err
 	}
@@ -215,7 +234,11 @@ func (db *DB) compactLocked() error {
 		return nil
 	}
 
-	merged, err := mergeSSTables(db.path, db.nextSSTID, db.sstables)
+	db.logger.Info("compaction started",
+		zap.Int("sstables", len(db.sstables)),
+	)
+
+	merged, err := mergeSSTables(db.path, db.nextSSTID, db.sstables, db.logger)
 	if err != nil {
 		return err
 	}
@@ -226,6 +249,10 @@ func (db *DB) compactLocked() error {
 	}
 	db.sstables = []*sstable{merged}
 	db.nextSSTID++
+
+	db.logger.Info("compaction finished",
+		zap.Uint64("sstable_id", merged.id),
+	)
 
 	return nil
 }
@@ -246,12 +273,15 @@ func (db *DB) loadSSTables() error {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
 	for _, id := range ids {
-		sst, err := loadSSTable(db.path, id)
+		sst, err := loadSSTable(db.path, id, db.logger)
 		if err != nil {
 			return err
 		}
 		db.sstables = append(db.sstables, sst)
 		db.nextSSTID = max(db.nextSSTID, id+1)
+	}
+	if len(ids) > 0 {
+		db.logger.Info("sstables loaded", zap.Int("count", len(ids)))
 	}
 	return nil
 }
@@ -260,6 +290,11 @@ func (db *DB) replayWAL() error {
 	records, err := db.wal.readAll()
 	if err != nil {
 		return err
+	}
+	if len(records) > 0 {
+		db.logger.Info("wal replay",
+			zap.Int("records", len(records)),
+		)
 	}
 	for _, rec := range records {
 		switch rec.op {

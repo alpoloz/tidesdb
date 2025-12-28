@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"go.uber.org/zap"
 )
 
 type sstable struct {
@@ -18,9 +20,13 @@ type sstable struct {
 	dataPath  string
 	indexPath string
 	index     map[string]int64
+	logger    *zap.Logger
 }
 
-func createSSTable(dir string, id uint64, keys []string, mem map[string]entry) (*sstable, error) {
+func createSSTable(dir string, id uint64, keys []string, mem map[string]entry, logger *zap.Logger) (*sstable, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	dataPath := filepath.Join(dir, sstDataName(id))
 	indexPath := filepath.Join(dir, sstIndexName(id))
 
@@ -66,17 +72,27 @@ func createSSTable(dir string, id uint64, keys []string, mem map[string]entry) (
 		return nil, err
 	}
 
-	return &sstable{id: id, dataPath: dataPath, indexPath: indexPath, index: index}, nil
+	logger.Info("sstable created",
+		zap.Uint64("sstable_id", id),
+		zap.Int("entries", len(keys)),
+	)
+	return &sstable{id: id, dataPath: dataPath, indexPath: indexPath, index: index, logger: logger}, nil
 }
 
-func loadSSTable(dir string, id uint64) (*sstable, error) {
+func loadSSTable(dir string, id uint64, logger *zap.Logger) (*sstable, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	dataPath := filepath.Join(dir, sstDataName(id))
 	indexPath := filepath.Join(dir, sstIndexName(id))
 	index, err := readIndex(indexPath)
 	if err != nil {
 		return nil, err
 	}
-	return &sstable{id: id, dataPath: dataPath, indexPath: indexPath, index: index}, nil
+	logger.Info("sstable loaded",
+		zap.Uint64("sstable_id", id),
+	)
+	return &sstable{id: id, dataPath: dataPath, indexPath: indexPath, index: index, logger: logger}, nil
 }
 
 func (s *sstable) get(key string) (entry, bool, error) {
@@ -106,7 +122,10 @@ func (s *sstable) remove() error {
 	return os.Remove(s.indexPath)
 }
 
-func mergeSSTables(dir string, id uint64, tables []*sstable) (*sstable, error) {
+func mergeSSTables(dir string, id uint64, tables []*sstable, logger *zap.Logger) (*sstable, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	type tableKey struct {
 		key string
 		idx int
@@ -148,7 +167,12 @@ func mergeSSTables(dir string, id uint64, tables []*sstable) (*sstable, error) {
 		keys = append(keys, item.key)
 	}
 
-	return createSSTable(dir, id, keys, mem)
+	logger.Info("sstable merge",
+		zap.Uint64("sstable_id", id),
+		zap.Int("sources", len(tables)),
+		zap.Int("entries", len(keys)),
+	)
+	return createSSTable(dir, id, keys, mem, logger)
 }
 
 func parseSSTableID(name string) (uint64, bool) {

@@ -4,11 +4,20 @@ import (
 	"fmt"
 	"log"
 
+	"go.uber.org/zap"
 	"tidesdb"
 )
 
 func main() {
-	db, err := tidesdb.Open("data", nil)
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() {
+		_ = logger.Sync()
+	}()
+
+	db, err := tidesdb.Open("data", logger, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
