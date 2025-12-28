@@ -1,0 +1,282 @@
+package tidesdb
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+)
+
+const (
+	defaultMemtableMaxBytes = 4 << 20
+	defaultMaxSSTables      = 4
+)
+
+var ErrNotFound = errors.New("key not found")
+
+type entry struct {
+	value     []byte
+	tombstone bool
+}
+
+type Options struct {
+	MemtableMaxBytes int
+	MaxSSTables      int
+}
+
+type DB struct {
+	mu sync.RWMutex
+
+	path      string
+	opts      Options
+	memtable  map[string]entry
+	memBytes  int
+	wal       *wal
+	sstables  []*sstable
+	nextSSTID uint64
+}
+
+func Open(path string, opts *Options) (*DB, error) {
+	if path == "" {
+		return nil, errors.New("path required")
+	}
+	options := Options{
+		MemtableMaxBytes: defaultMemtableMaxBytes,
+		MaxSSTables:      defaultMaxSSTables,
+	}
+	if opts != nil {
+		if opts.MemtableMaxBytes > 0 {
+			options.MemtableMaxBytes = opts.MemtableMaxBytes
+		}
+		if opts.MaxSSTables > 0 {
+			options.MaxSSTables = opts.MaxSSTables
+		}
+	}
+
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return nil, err
+	}
+
+	w, err := openWAL(filepath.Join(path, "wal.log"))
+	if err != nil {
+		return nil, err
+	}
+
+	db := &DB{
+		path:     path,
+		opts:     options,
+		memtable: make(map[string]entry),
+		wal:      w,
+	}
+
+	if err := db.loadSSTables(); err != nil {
+		_ = w.Close()
+		return nil, err
+	}
+	if err := db.replayWAL(); err != nil {
+		_ = w.Close()
+		return nil, err
+	}
+
+	return db, nil
+}
+
+func (db *DB) Put(key string, value []byte) error {
+	if key == "" {
+		return errors.New("key required")
+	}
+	valCopy := append([]byte(nil), value...)
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if err := db.wal.appendRecord(walOpPut, key, valCopy); err != nil {
+		return err
+	}
+	db.insertMemtable(key, entry{value: valCopy})
+
+	if db.memBytes >= db.opts.MemtableMaxBytes {
+		return db.flushLocked()
+	}
+	return nil
+}
+
+func (db *DB) Delete(key string) error {
+	if key == "" {
+		return errors.New("key required")
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if err := db.wal.appendRecord(walOpDelete, key, nil); err != nil {
+		return err
+	}
+	db.insertMemtable(key, entry{tombstone: true})
+
+	if db.memBytes >= db.opts.MemtableMaxBytes {
+		return db.flushLocked()
+	}
+	return nil
+}
+
+func (db *DB) Get(key string) ([]byte, error) {
+	if key == "" {
+		return nil, errors.New("key required")
+	}
+
+	db.mu.RLock()
+	if ent, ok := db.memtable[key]; ok {
+		if ent.tombstone {
+			db.mu.RUnlock()
+			return nil, ErrNotFound
+		}
+		val := append([]byte(nil), ent.value...)
+		db.mu.RUnlock()
+		return val, nil
+	}
+	sstables := append([]*sstable(nil), db.sstables...)
+	db.mu.RUnlock()
+
+	for i := len(sstables) - 1; i >= 0; i-- {
+		ent, ok, err := sstables[i].get(key)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		if ent.tombstone {
+			return nil, ErrNotFound
+		}
+		return append([]byte(nil), ent.value...), nil
+	}
+
+	return nil, ErrNotFound
+}
+
+func (db *DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.wal.Close()
+}
+
+func (db *DB) insertMemtable(key string, ent entry) {
+	if existing, ok := db.memtable[key]; ok {
+		db.memBytes -= memtableSize(key, existing)
+	}
+	db.memtable[key] = ent
+	db.memBytes += memtableSize(key, ent)
+}
+
+func memtableSize(key string, ent entry) int {
+	return len(key) + len(ent.value) + 1
+}
+
+func (db *DB) flushLocked() error {
+	if len(db.memtable) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(db.memtable))
+	for key := range db.memtable {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	id := db.nextSSTID
+	db.nextSSTID++
+
+	sst, err := createSSTable(db.path, id, keys, db.memtable)
+	if err != nil {
+		return err
+	}
+	if err := db.wal.reset(); err != nil {
+		return err
+	}
+
+	db.sstables = append(db.sstables, sst)
+	db.memtable = make(map[string]entry)
+	db.memBytes = 0
+
+	if len(db.sstables) > db.opts.MaxSSTables {
+		if err := db.compactLocked(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (db *DB) compactLocked() error {
+	if len(db.sstables) < 2 {
+		return nil
+	}
+
+	merged, err := mergeSSTables(db.path, db.nextSSTID, db.sstables)
+	if err != nil {
+		return err
+	}
+	for _, sst := range db.sstables {
+		if err := sst.remove(); err != nil {
+			return err
+		}
+	}
+	db.sstables = []*sstable{merged}
+	db.nextSSTID++
+
+	return nil
+}
+
+func (db *DB) loadSSTables() error {
+	entries, err := os.ReadDir(db.path)
+	if err != nil {
+		return err
+	}
+
+	var ids []uint64
+	for _, entry := range entries {
+		id, ok := parseSSTableID(entry.Name())
+		if ok {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	for _, id := range ids {
+		sst, err := loadSSTable(db.path, id)
+		if err != nil {
+			return err
+		}
+		db.sstables = append(db.sstables, sst)
+		db.nextSSTID = max(db.nextSSTID, id+1)
+	}
+	return nil
+}
+
+func (db *DB) replayWAL() error {
+	records, err := db.wal.readAll()
+	if err != nil {
+		return err
+	}
+	for _, rec := range records {
+		switch rec.op {
+		case walOpPut:
+			db.insertMemtable(rec.key, entry{value: rec.value})
+		case walOpDelete:
+			db.insertMemtable(rec.key, entry{tombstone: true})
+		default:
+			return fmt.Errorf("unknown wal op %d", rec.op)
+		}
+	}
+	return nil
+}
+
+func max(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
