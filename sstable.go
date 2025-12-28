@@ -23,7 +23,12 @@ type sstable struct {
 	logger    *zap.Logger
 }
 
-func createSSTable(dir string, id uint64, keys []string, mem map[string]entry, logger *zap.Logger) (*sstable, error) {
+type sstEntry struct {
+	key   string
+	entry entry
+}
+
+func createSSTable(dir string, id uint64, entries []sstEntry, logger *zap.Logger) (*sstable, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -44,18 +49,17 @@ func createSSTable(dir string, id uint64, keys []string, mem map[string]entry, l
 	dataWriter := bufio.NewWriter(dataFile)
 	indexWriter := bufio.NewWriter(indexFile)
 
-	index := make(map[string]int64, len(keys))
+	index := make(map[string]int64, len(entries))
 	var offset int64
-	for _, key := range keys {
-		ent := mem[key]
-		recordSize := recordEncodedSize(key, ent)
-		if err := writeRecord(dataWriter, key, ent); err != nil {
+	for _, item := range entries {
+		recordSize := recordEncodedSize(item.key, item.entry)
+		if err := writeRecord(dataWriter, item.key, item.entry); err != nil {
 			return nil, err
 		}
-		if err := writeIndexEntry(indexWriter, key, offset); err != nil {
+		if err := writeIndexEntry(indexWriter, item.key, offset); err != nil {
 			return nil, err
 		}
-		index[key] = offset
+		index[item.key] = offset
 		offset += recordSize
 	}
 
@@ -74,7 +78,7 @@ func createSSTable(dir string, id uint64, keys []string, mem map[string]entry, l
 
 	logger.Info("sstable created",
 		zap.Uint64("sstable_id", id),
-		zap.Int("entries", len(keys)),
+		zap.Int("entries", len(entries)),
 	)
 	return &sstable{id: id, dataPath: dataPath, indexPath: indexPath, index: index, logger: logger}, nil
 }
@@ -150,8 +154,7 @@ func mergeSSTables(dir string, id uint64, tables []*sstable, logger *zap.Logger)
 	}
 	sort.Slice(keyList, func(i, j int) bool { return keyList[i].key < keyList[j].key })
 
-	mem := make(map[string]entry)
-	keys := make([]string, 0, len(keyList))
+	entries := make([]sstEntry, 0, len(keyList))
 	for _, item := range keyList {
 		ent, ok, err := tables[item.idx].get(item.key)
 		if err != nil {
@@ -163,16 +166,15 @@ func mergeSSTables(dir string, id uint64, tables []*sstable, logger *zap.Logger)
 		if ent.tombstone {
 			continue
 		}
-		mem[item.key] = ent
-		keys = append(keys, item.key)
+		entries = append(entries, sstEntry{key: item.key, entry: ent})
 	}
 
 	logger.Info("sstable merge",
 		zap.Uint64("sstable_id", id),
 		zap.Int("sources", len(tables)),
-		zap.Int("entries", len(keys)),
+		zap.Int("entries", len(entries)),
 	)
-	return createSSTable(dir, id, keys, mem, logger)
+	return createSSTable(dir, id, entries, logger)
 }
 
 func parseSSTableID(name string) (uint64, bool) {

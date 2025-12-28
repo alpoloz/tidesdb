@@ -33,7 +33,7 @@ type DB struct {
 
 	path      string
 	opts      Options
-	memtable  map[string]entry
+	memtable  *memtable
 	memBytes  int
 	wal       *wal
 	sstables  []*sstable
@@ -73,7 +73,7 @@ func Open(path string, logger *zap.Logger, opts *Options) (*DB, error) {
 	db := &DB{
 		path:     path,
 		opts:     options,
-		memtable: make(map[string]entry),
+		memtable: newMemtable(),
 		wal:      w,
 		logger:   logger,
 	}
@@ -90,7 +90,7 @@ func Open(path string, logger *zap.Logger, opts *Options) (*DB, error) {
 	db.logger.Info("db opened",
 		zap.String("path", path),
 		zap.Int("sstables", len(db.sstables)),
-		zap.Int("memtable_entries", len(db.memtable)),
+		zap.Int("memtable_entries", db.memtable.len()),
 	)
 
 	return db, nil
@@ -141,7 +141,7 @@ func (db *DB) Get(key string) ([]byte, error) {
 	}
 
 	db.mu.RLock()
-	if ent, ok := db.memtable[key]; ok {
+	if ent, ok := db.memtable.get(key); ok {
 		if ent.tombstone {
 			db.mu.RUnlock()
 			return nil, ErrNotFound
@@ -177,38 +177,27 @@ func (db *DB) Close() error {
 }
 
 func (db *DB) insertMemtable(key string, ent entry) {
-	if existing, ok := db.memtable[key]; ok {
-		db.memBytes -= memtableSize(key, existing)
-	}
-	db.memtable[key] = ent
-	db.memBytes += memtableSize(key, ent)
-}
-
-func memtableSize(key string, ent entry) int {
-	return len(key) + len(ent.value) + 1
+	db.memtable.set(key, ent)
+	db.memBytes = db.memtable.bytesUsed()
 }
 
 func (db *DB) flushLocked() error {
-	if len(db.memtable) == 0 {
+	if db.memtable.len() == 0 {
 		return nil
 	}
 
-	keys := make([]string, 0, len(db.memtable))
-	for key := range db.memtable {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	entries := db.memtable.entries()
 
 	id := db.nextSSTID
 	db.nextSSTID++
 
 	db.logger.Info("flushing memtable",
 		zap.Uint64("sstable_id", id),
-		zap.Int("entries", len(keys)),
+		zap.Int("entries", len(entries)),
 		zap.Int("mem_bytes", db.memBytes),
 	)
 
-	sst, err := createSSTable(db.path, id, keys, db.memtable, db.logger)
+	sst, err := createSSTable(db.path, id, entries, db.logger)
 	if err != nil {
 		return err
 	}
@@ -217,7 +206,7 @@ func (db *DB) flushLocked() error {
 	}
 
 	db.sstables = append(db.sstables, sst)
-	db.memtable = make(map[string]entry)
+	db.memtable = newMemtable()
 	db.memBytes = 0
 
 	if len(db.sstables) > db.opts.MaxSSTables {
