@@ -2,6 +2,7 @@ package tidesdb
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -15,11 +16,15 @@ import (
 	"go.uber.org/zap"
 )
 
+const sstableBlockSize = 4 << 10
+
 type sstable struct {
 	id        uint64
 	dataPath  string
 	indexPath string
-	index     map[string]int64
+	bloomPath string
+	index     []blockIndexEntry
+	bloom     *bloomFilter
 	logger    *zap.Logger
 }
 
@@ -28,12 +33,18 @@ type sstEntry struct {
 	entry entry
 }
 
+type blockIndexEntry struct {
+	firstKey string
+	offset   int64
+}
+
 func createSSTable(dir string, id uint64, entries []sstEntry, logger *zap.Logger) (*sstable, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	dataPath := filepath.Join(dir, sstDataName(id))
 	indexPath := filepath.Join(dir, sstIndexName(id))
+	bloomPath := filepath.Join(dir, sstBloomName(id))
 
 	dataFile, err := os.Create(dataPath)
 	if err != nil {
@@ -45,22 +56,56 @@ func createSSTable(dir string, id uint64, entries []sstEntry, logger *zap.Logger
 		return nil, err
 	}
 	defer indexFile.Close()
+	bloomFile, err := os.Create(bloomPath)
+	if err != nil {
+		return nil, err
+	}
+	defer bloomFile.Close()
 
 	dataWriter := bufio.NewWriter(dataFile)
 	indexWriter := bufio.NewWriter(indexFile)
+	bloomWriter := bufio.NewWriter(bloomFile)
 
-	index := make(map[string]int64, len(entries))
+	index := make([]blockIndexEntry, 0, len(entries))
+	filter := newBloomFilter(len(entries), 10)
 	var offset int64
+	var blockBuf bytes.Buffer
+	blockFirstKey := ""
+
+	flushBlock := func() error {
+		if blockBuf.Len() == 0 {
+			return nil
+		}
+		if err := writeIndexEntry(indexWriter, blockFirstKey, offset); err != nil {
+			return err
+		}
+		index = append(index, blockIndexEntry{firstKey: blockFirstKey, offset: offset})
+		if err := writeBlock(dataWriter, blockBuf.Bytes()); err != nil {
+			return err
+		}
+		offset += int64(4 + blockBuf.Len())
+		blockBuf.Reset()
+		return nil
+	}
+
 	for _, item := range entries {
 		recordSize := recordEncodedSize(item.key, item.entry)
-		if err := writeRecord(dataWriter, item.key, item.entry); err != nil {
+		if blockBuf.Len() == 0 {
+			blockFirstKey = item.key
+		}
+		if blockBuf.Len() > 0 && blockBuf.Len()+int(recordSize) > sstableBlockSize {
+			if err := flushBlock(); err != nil {
+				return nil, err
+			}
+			blockFirstKey = item.key
+		}
+		if err := writeRecord(&blockBuf, item.key, item.entry); err != nil {
 			return nil, err
 		}
-		if err := writeIndexEntry(indexWriter, item.key, offset); err != nil {
-			return nil, err
-		}
-		index[item.key] = offset
-		offset += recordSize
+		filter.add(item.key)
+	}
+	if err := flushBlock(); err != nil {
+		return nil, err
 	}
 
 	if err := dataWriter.Flush(); err != nil {
@@ -69,10 +114,19 @@ func createSSTable(dir string, id uint64, entries []sstEntry, logger *zap.Logger
 	if err := indexWriter.Flush(); err != nil {
 		return nil, err
 	}
+	if _, err := bloomWriter.Write(filter.encode()); err != nil {
+		return nil, err
+	}
+	if err := bloomWriter.Flush(); err != nil {
+		return nil, err
+	}
 	if err := dataFile.Sync(); err != nil {
 		return nil, err
 	}
 	if err := indexFile.Sync(); err != nil {
+		return nil, err
+	}
+	if err := bloomFile.Sync(); err != nil {
 		return nil, err
 	}
 
@@ -80,7 +134,15 @@ func createSSTable(dir string, id uint64, entries []sstEntry, logger *zap.Logger
 		zap.Uint64("sstable_id", id),
 		zap.Int("entries", len(entries)),
 	)
-	return &sstable{id: id, dataPath: dataPath, indexPath: indexPath, index: index, logger: logger}, nil
+	return &sstable{
+		id:        id,
+		dataPath:  dataPath,
+		indexPath: indexPath,
+		bloomPath: bloomPath,
+		index:     index,
+		bloom:     filter,
+		logger:    logger,
+	}, nil
 }
 
 func loadSSTable(dir string, id uint64, logger *zap.Logger) (*sstable, error) {
@@ -89,21 +151,44 @@ func loadSSTable(dir string, id uint64, logger *zap.Logger) (*sstable, error) {
 	}
 	dataPath := filepath.Join(dir, sstDataName(id))
 	indexPath := filepath.Join(dir, sstIndexName(id))
+	bloomPath := filepath.Join(dir, sstBloomName(id))
 	index, err := readIndex(indexPath)
 	if err != nil {
+		return nil, err
+	}
+	filter, err := readBloom(bloomPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	logger.Info("sstable loaded",
 		zap.Uint64("sstable_id", id),
 	)
-	return &sstable{id: id, dataPath: dataPath, indexPath: indexPath, index: index, logger: logger}, nil
+	return &sstable{
+		id:        id,
+		dataPath:  dataPath,
+		indexPath: indexPath,
+		bloomPath: bloomPath,
+		index:     index,
+		bloom:     filter,
+		logger:    logger,
+	}, nil
 }
 
 func (s *sstable) get(key string) (entry, bool, error) {
-	offset, ok := s.index[key]
-	if !ok {
+	if s.bloom != nil && !s.bloom.mayContain(key) {
 		return entry{}, false, nil
 	}
+	if len(s.index) == 0 {
+		return entry{}, false, nil
+	}
+	pos := sort.Search(len(s.index), func(i int) bool {
+		return s.index[i].firstKey > key
+	})
+	blockIdx := pos - 1
+	if blockIdx < 0 {
+		return entry{}, false, nil
+	}
+	offset := s.index[blockIdx].offset
 	file, err := os.Open(s.dataPath)
 	if err != nil {
 		return entry{}, false, err
@@ -112,18 +197,42 @@ func (s *sstable) get(key string) (entry, bool, error) {
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
 		return entry{}, false, err
 	}
-	ent, _, err := readRecord(file)
-	if err != nil {
+	var blockLen uint32
+	if err := binary.Read(file, binary.LittleEndian, &blockLen); err != nil {
 		return entry{}, false, err
 	}
-	return ent, true, nil
+	block := make([]byte, blockLen)
+	if _, err := io.ReadFull(file, block); err != nil {
+		return entry{}, false, err
+	}
+	reader := bytes.NewReader(block)
+	for reader.Len() > 0 {
+		recKey, ent, _, err := readRecord(reader)
+		if err != nil {
+			return entry{}, false, err
+		}
+		cmp := strings.Compare(recKey, key)
+		if cmp == 0 {
+			return ent, true, nil
+		}
+		if cmp > 0 {
+			return entry{}, false, nil
+		}
+	}
+	return entry{}, false, nil
 }
 
 func (s *sstable) remove() error {
 	if err := os.Remove(s.dataPath); err != nil {
 		return err
 	}
-	return os.Remove(s.indexPath)
+	if err := os.Remove(s.indexPath); err != nil {
+		return err
+	}
+	if err := os.Remove(s.bloomPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func mergeSSTables(dir string, id uint64, tables []*sstable, logger *zap.Logger) (*sstable, error) {
@@ -137,14 +246,20 @@ func mergeSSTables(dir string, id uint64, tables []*sstable, logger *zap.Logger)
 
 	keysMap := make(map[string]int)
 	for i, sst := range tables {
-		for key := range sst.index {
-			if existing, ok := keysMap[key]; ok {
-				if existing < i {
-					keysMap[key] = i
-				}
-				continue
+		for _, block := range sst.index {
+			blockKeys, err := sst.readBlockKeys(block.offset)
+			if err != nil {
+				return nil, err
 			}
-			keysMap[key] = i
+			for _, key := range blockKeys {
+				if existing, ok := keysMap[key]; ok {
+					if existing < i {
+						keysMap[key] = i
+					}
+					continue
+				}
+				keysMap[key] = i
+			}
 		}
 	}
 
@@ -196,6 +311,10 @@ func sstIndexName(id uint64) string {
 	return fmt.Sprintf("sst_%06d.idx", id)
 }
 
+func sstBloomName(id uint64) string {
+	return fmt.Sprintf("sst_%06d.bloom", id)
+}
+
 func writeRecord(w io.Writer, key string, ent entry) error {
 	keyLen := uint32(len(key))
 	valLen := uint32(len(ent.value))
@@ -223,31 +342,32 @@ func writeRecord(w io.Writer, key string, ent entry) error {
 	return nil
 }
 
-func readRecord(r io.Reader) (entry, int64, error) {
+func readRecord(r io.Reader) (string, entry, int64, error) {
 	var keyLen uint32
 	var valLen uint32
 	if err := binary.Read(r, binary.LittleEndian, &keyLen); err != nil {
-		return entry{}, 0, err
+		return "", entry{}, 0, err
 	}
 	if err := binary.Read(r, binary.LittleEndian, &valLen); err != nil {
-		return entry{}, 0, err
+		return "", entry{}, 0, err
 	}
 	var tombstoneByte byte
 	if err := binary.Read(r, binary.LittleEndian, &tombstoneByte); err != nil {
-		return entry{}, 0, err
+		return "", entry{}, 0, err
 	}
 	key := make([]byte, keyLen)
 	if _, err := io.ReadFull(r, key); err != nil {
-		return entry{}, 0, err
+		return "", entry{}, 0, err
 	}
 	value := make([]byte, valLen)
 	if valLen > 0 {
 		if _, err := io.ReadFull(r, value); err != nil {
-			return entry{}, 0, err
+			return "", entry{}, 0, err
 		}
 	}
 	ent := entry{value: value, tombstone: tombstoneByte == 1}
-	return ent, recordEncodedSize(string(key), ent), nil
+	keyStr := string(key)
+	return keyStr, ent, recordEncodedSize(keyStr, ent), nil
 }
 
 func writeIndexEntry(w io.Writer, key string, offset int64) error {
@@ -261,7 +381,7 @@ func writeIndexEntry(w io.Writer, key string, offset int64) error {
 	return binary.Write(w, binary.LittleEndian, offset)
 }
 
-func readIndex(path string) (map[string]int64, error) {
+func readIndex(path string) ([]blockIndexEntry, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -269,7 +389,7 @@ func readIndex(path string) (map[string]int64, error) {
 	defer file.Close()
 
 	reader := bufio.NewReader(file)
-	index := make(map[string]int64)
+	index := make([]blockIndexEntry, 0)
 	for {
 		var keyLen uint32
 		if err := binary.Read(reader, binary.LittleEndian, &keyLen); err != nil {
@@ -286,9 +406,61 @@ func readIndex(path string) (map[string]int64, error) {
 		if err := binary.Read(reader, binary.LittleEndian, &offset); err != nil {
 			return nil, err
 		}
-		index[string(key)] = offset
+		index = append(index, blockIndexEntry{firstKey: string(key), offset: offset})
 	}
 	return index, nil
+}
+
+func readBloom(path string) (*bloomFilter, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	filter := decodeBloomFilter(data)
+	if filter == nil {
+		return nil, errors.New("invalid bloom filter")
+	}
+	return filter, nil
+}
+
+func writeBlock(w io.Writer, data []byte) error {
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(data))); err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	_, err := w.Write(data)
+	return err
+}
+
+func (s *sstable) readBlockKeys(offset int64) ([]string, error) {
+	file, err := os.Open(s.dataPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return nil, err
+	}
+	var blockLen uint32
+	if err := binary.Read(file, binary.LittleEndian, &blockLen); err != nil {
+		return nil, err
+	}
+	block := make([]byte, blockLen)
+	if _, err := io.ReadFull(file, block); err != nil {
+		return nil, err
+	}
+	reader := bytes.NewReader(block)
+	keys := make([]string, 0)
+	for reader.Len() > 0 {
+		recKey, _, _, err := readRecord(reader)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, recKey)
+	}
+	return keys, nil
 }
 
 func recordEncodedSize(key string, ent entry) int64 {
