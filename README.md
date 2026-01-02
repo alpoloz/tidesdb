@@ -44,7 +44,7 @@ func main() {
 		_ = logger.Sync()
 	}()
 
-	db, err := tidesdb.Open("data", logger, nil)
+	db, err := tidesdb.Open(logger, "data", nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func main() {
 		_ = logger.Sync()
 	}()
 
-	db, err := tidesdb.Open("data", logger, nil)
+	db, err := tidesdb.Open(logger, "data", nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func main() {
 	}
 	_ = db.Close()
 
-	db, err = tidesdb.Open("data", logger, nil)
+	db, err = tidesdb.Open(logger, "data", nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -126,7 +126,7 @@ opts := &tidesdb.Options{
 	MemtableMaxBytes: 1 << 20,
 	MaxSSTables:      2,
 }
-db, err := tidesdb.Open("data", logger, opts)
+db, err := tidesdb.Open(logger, "data", opts)
 if err != nil {
 	log.Fatal(err)
 }

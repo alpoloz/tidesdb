@@ -17,7 +17,7 @@ func main() {
 		_ = logger.Sync()
 	}()
 
-	db, err := tidesdb.Open("data", logger, nil)
+	db, err := tidesdb.Open(logger, "data", nil)
 	if err != nil {
 		log.Fatal(err)
 	}

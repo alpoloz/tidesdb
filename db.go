@@ -14,6 +14,7 @@ import (
 const (
 	defaultMemtableMaxBytes = 4 << 20
 	defaultMaxSSTables      = 4
+	defaultMaxLevels        = 3
 )
 
 var ErrNotFound = errors.New("key not found")
@@ -26,6 +27,7 @@ type entry struct {
 type Options struct {
 	MemtableMaxBytes int
 	MaxSSTables      int
+	MaxLevels        int
 }
 
 type DB struct {
@@ -36,12 +38,12 @@ type DB struct {
 	memtable  *memtable
 	memBytes  int
 	wal       *wal
-	sstables  []*sstable
+	sstables  [][]*sstable
 	nextSSTID uint64
 	logger    *zap.Logger
 }
 
-func Open(path string, logger *zap.Logger, opts *Options) (*DB, error) {
+func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
 	if path == "" {
 		return nil, errors.New("path required")
 	}
@@ -51,6 +53,7 @@ func Open(path string, logger *zap.Logger, opts *Options) (*DB, error) {
 	options := Options{
 		MemtableMaxBytes: defaultMemtableMaxBytes,
 		MaxSSTables:      defaultMaxSSTables,
+		MaxLevels:        defaultMaxLevels,
 	}
 	if opts != nil {
 		if opts.MemtableMaxBytes > 0 {
@@ -59,13 +62,16 @@ func Open(path string, logger *zap.Logger, opts *Options) (*DB, error) {
 		if opts.MaxSSTables > 0 {
 			options.MaxSSTables = opts.MaxSSTables
 		}
+		if opts.MaxLevels > 0 {
+			options.MaxLevels = opts.MaxLevels
+		}
 	}
 
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return nil, err
 	}
 
-	w, err := openWAL(filepath.Join(path, "wal.log"), logger)
+	w, err := openWAL(logger, filepath.Join(path, "wal.log"))
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +82,7 @@ func Open(path string, logger *zap.Logger, opts *Options) (*DB, error) {
 		memtable: newMemtable(),
 		wal:      w,
 		logger:   logger,
+		sstables: make([][]*sstable, options.MaxLevels),
 	}
 
 	if err := db.loadSSTables(); err != nil {
@@ -89,7 +96,7 @@ func Open(path string, logger *zap.Logger, opts *Options) (*DB, error) {
 
 	db.logger.Info("db opened",
 		zap.String("path", path),
-		zap.Int("sstables", len(db.sstables)),
+		zap.Int("sstables", db.totalSSTables()),
 		zap.Int("memtable_entries", db.memtable.len()),
 	)
 
@@ -150,21 +157,23 @@ func (db *DB) Get(key string) ([]byte, error) {
 		db.mu.RUnlock()
 		return val, nil
 	}
-	sstables := append([]*sstable(nil), db.sstables...)
+	sstables := db.snapshotSSTables()
 	db.mu.RUnlock()
 
-	for i := len(sstables) - 1; i >= 0; i-- {
-		ent, ok, err := sstables[i].get(key)
-		if err != nil {
-			return nil, err
+	for _, level := range sstables {
+		for i := len(level) - 1; i >= 0; i-- {
+			ent, ok, err := level[i].get(key)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+			if ent.tombstone {
+				return nil, ErrNotFound
+			}
+			return append([]byte(nil), ent.value...), nil
 		}
-		if !ok {
-			continue
-		}
-		if ent.tombstone {
-			return nil, ErrNotFound
-		}
-		return append([]byte(nil), ent.value...), nil
 	}
 
 	return nil, ErrNotFound
@@ -197,7 +206,7 @@ func (db *DB) flushLocked() error {
 		zap.Int("mem_bytes", db.memBytes),
 	)
 
-	sst, err := createSSTable(db.path, id, entries, db.logger)
+	sst, err := createSSTable(db.logger, db.path, 0, id, entries)
 	if err != nil {
 		return err
 	}
@@ -205,12 +214,12 @@ func (db *DB) flushLocked() error {
 		return err
 	}
 
-	db.sstables = append(db.sstables, sst)
+	db.sstables[0] = append(db.sstables[0], sst)
 	db.memtable = newMemtable()
 	db.memBytes = 0
 
-	if len(db.sstables) > db.opts.MaxSSTables {
-		if err := db.compactLocked(); err != nil {
+	if len(db.sstables[0]) > db.opts.MaxSSTables {
+		if err := db.compactLocked(0); err != nil {
 			return err
 		}
 	}
@@ -218,31 +227,47 @@ func (db *DB) flushLocked() error {
 	return nil
 }
 
-func (db *DB) compactLocked() error {
-	if len(db.sstables) < 2 {
-		return nil
-	}
+func (db *DB) compactLocked(level int) error {
+	for level < len(db.sstables) {
+		if len(db.sstables[level]) <= db.opts.MaxSSTables {
+			return nil
+		}
+		nextLevel := level + 1
+		db.ensureLevel(nextLevel)
 
-	db.logger.Info("compaction started",
-		zap.Int("sstables", len(db.sstables)),
-	)
+		tables := append([]*sstable(nil), db.sstables[level]...)
+		tables = append(tables, db.sstables[nextLevel]...)
+		if len(tables) < 2 {
+			return nil
+		}
 
-	merged, err := mergeSSTables(db.path, db.nextSSTID, db.sstables, db.logger)
-	if err != nil {
-		return err
-	}
-	for _, sst := range db.sstables {
-		if err := sst.remove(); err != nil {
+		db.logger.Info("compaction started",
+			zap.Int("level", level),
+			zap.Int("next_level", nextLevel),
+			zap.Int("tables", len(tables)),
+		)
+
+		merged, err := mergeSSTables(db.logger, db.path, nextLevel, db.nextSSTID, tables)
+		if err != nil {
 			return err
 		}
+		for _, sst := range tables {
+			if err := sst.remove(); err != nil {
+				return err
+			}
+		}
+		db.sstables[level] = nil
+		db.sstables[nextLevel] = []*sstable{merged}
+		db.nextSSTID++
+
+		db.logger.Info("compaction finished",
+			zap.Int("level", level),
+			zap.Int("next_level", nextLevel),
+			zap.Uint64("sstable_id", merged.id),
+		)
+
+		level = nextLevel
 	}
-	db.sstables = []*sstable{merged}
-	db.nextSSTID++
-
-	db.logger.Info("compaction finished",
-		zap.Uint64("sstable_id", merged.id),
-	)
-
 	return nil
 }
 
@@ -252,25 +277,45 @@ func (db *DB) loadSSTables() error {
 		return err
 	}
 
-	var ids []uint64
+	byLevel := map[int][]uint64{}
+	var legacyIDs []uint64
 	for _, entry := range entries {
-		id, ok := parseSSTableID(entry.Name())
+		level, id, ok, legacy := parseSSTableName(entry.Name())
 		if ok {
-			ids = append(ids, id)
+			if legacy {
+				legacyIDs = append(legacyIDs, id)
+				continue
+			}
+			byLevel[level] = append(byLevel[level], id)
 		}
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
-	for _, id := range ids {
-		sst, err := loadSSTable(db.path, id, db.logger)
-		if err != nil {
-			return err
+	for level, ids := range byLevel {
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		db.ensureLevel(level)
+		for _, id := range ids {
+			sst, err := loadSSTable(db.logger, db.path, level, id)
+			if err != nil {
+				return err
+			}
+			db.sstables[level] = append(db.sstables[level], sst)
+			db.nextSSTID = max(db.nextSSTID, id+1)
 		}
-		db.sstables = append(db.sstables, sst)
-		db.nextSSTID = max(db.nextSSTID, id+1)
 	}
-	if len(ids) > 0 {
-		db.logger.Info("sstables loaded", zap.Int("count", len(ids)))
+	if len(legacyIDs) > 0 {
+		sort.Slice(legacyIDs, func(i, j int) bool { return legacyIDs[i] < legacyIDs[j] })
+		db.ensureLevel(0)
+		for _, id := range legacyIDs {
+			sst, err := migrateLegacySSTable(db.logger, db.path, id)
+			if err != nil {
+				return err
+			}
+			db.sstables[0] = append(db.sstables[0], sst)
+			db.nextSSTID = max(db.nextSSTID, id+1)
+		}
+	}
+	if len(byLevel) > 0 {
+		db.logger.Info("sstables loaded", zap.Int("count", db.totalSSTables()))
 	}
 	return nil
 }
@@ -303,4 +348,30 @@ func max(a, b uint64) uint64 {
 		return a
 	}
 	return b
+}
+
+func (db *DB) ensureLevel(level int) {
+	if level < len(db.sstables) {
+		return
+	}
+	needed := level + 1
+	for len(db.sstables) < needed {
+		db.sstables = append(db.sstables, nil)
+	}
+}
+
+func (db *DB) totalSSTables() int {
+	total := 0
+	for _, level := range db.sstables {
+		total += len(level)
+	}
+	return total
+}
+
+func (db *DB) snapshotSSTables() [][]*sstable {
+	result := make([][]*sstable, len(db.sstables))
+	for i := range db.sstables {
+		result[i] = append([]*sstable(nil), db.sstables[i]...)
+	}
+	return result
 }

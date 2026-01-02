@@ -28,7 +28,7 @@ type wal struct {
 	logger *zap.Logger
 }
 
-func openWAL(path string, logger *zap.Logger) (*wal, error) {
+func openWAL(logger *zap.Logger, path string) (*wal, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
