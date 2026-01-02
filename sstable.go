@@ -18,18 +18,19 @@ import (
 
 const (
 	sstableBlockSize = 4 << 10
-	bloomFooterMagic = "TDBBLOOM"
-	bloomFooterSize  = 8 + 8 + 4
+	tableFooterMagic = "TDBMETA0"
+	tableFooterSize  = 8 + 8 + 4
 )
 
 type sstable struct {
-	id        uint64
-	level     int
-	dataPath  string
-	indexPath string
-	index     []blockIndexEntry
-	bloom     *bloomFilter
-	logger    *zap.Logger
+	id       uint64
+	level    int
+	dataPath string
+	index    []blockIndexEntry
+	minKey   string
+	maxKey   string
+	bloom    *bloomFilter
+	logger   *zap.Logger
 }
 
 type sstEntry struct {
@@ -47,36 +48,36 @@ func createSSTable(logger *zap.Logger, dir string, level int, id uint64, entries
 		logger = zap.NewNop()
 	}
 	dataPath := filepath.Join(dir, sstDataName(level, id))
-	indexPath := filepath.Join(dir, sstIndexName(level, id))
+	sst := &sstable{
+		id:       id,
+		level:    level,
+		dataPath: dataPath,
+		logger:   logger,
+	}
 
 	dataFile, err := os.Create(dataPath)
 	if err != nil {
 		return nil, err
 	}
 	defer dataFile.Close()
-	indexFile, err := os.Create(indexPath)
-	if err != nil {
-		return nil, err
-	}
-	defer indexFile.Close()
 	dataWriter := bufio.NewWriter(dataFile)
-	indexWriter := bufio.NewWriter(indexFile)
 
 	index := make([]blockIndexEntry, 0, len(entries))
 	filter := newBloomFilter(len(entries), 10)
 	var offset int64
 	var blockBuf bytes.Buffer
+	var indexBuf bytes.Buffer
 	blockFirstKey := ""
 
 	flushBlock := func() error {
 		if blockBuf.Len() == 0 {
 			return nil
 		}
-		if err := writeIndexEntry(indexWriter, blockFirstKey, offset); err != nil {
+		if err := sst.writeIndexEntry(&indexBuf, blockFirstKey, offset); err != nil {
 			return err
 		}
 		index = append(index, blockIndexEntry{firstKey: blockFirstKey, offset: offset})
-		if err := writeBlock(dataWriter, blockBuf.Bytes()); err != nil {
+		if err := sst.writeBlock(dataWriter, blockBuf.Bytes()); err != nil {
 			return err
 		}
 		offset += int64(4 + blockBuf.Len())
@@ -85,7 +86,7 @@ func createSSTable(logger *zap.Logger, dir string, level int, id uint64, entries
 	}
 
 	for _, item := range entries {
-		recordSize := recordEncodedSize(item.key, item.entry)
+		recordSize := sst.recordEncodedSize(item.key, item.entry)
 		if blockBuf.Len() == 0 {
 			blockFirstKey = item.key
 		}
@@ -95,7 +96,7 @@ func createSSTable(logger *zap.Logger, dir string, level int, id uint64, entries
 			}
 			blockFirstKey = item.key
 		}
-		if err := writeRecord(&blockBuf, item.key, item.entry); err != nil {
+		if err := sst.writeRecord(&blockBuf, item.key, item.entry); err != nil {
 			return nil, err
 		}
 		filter.add(item.key)
@@ -104,27 +105,36 @@ func createSSTable(logger *zap.Logger, dir string, level int, id uint64, entries
 		return nil, err
 	}
 
-	bloomOffset := uint64(offset)
+	indexOffset := uint64(offset)
+	indexData := indexBuf.Bytes()
+	if len(indexData) > 0 {
+		if _, err := dataWriter.Write(indexData); err != nil {
+			return nil, err
+		}
+	}
+	bloomOffset := indexOffset + uint64(len(indexData))
 	bloomData := filter.encode()
 	if len(bloomData) > 0 {
 		if _, err := dataWriter.Write(bloomData); err != nil {
 			return nil, err
 		}
 	}
-	if err := writeBloomFooter(dataWriter, bloomOffset, uint32(len(bloomData))); err != nil {
+	metaOffset := bloomOffset + uint64(len(bloomData))
+	metaData, err := sst.buildMetaindex(indexOffset, uint32(len(indexData)), bloomOffset, uint32(len(bloomData)))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := dataWriter.Write(metaData); err != nil {
+		return nil, err
+	}
+	if err := sst.writeTableFooter(dataWriter, metaOffset, uint32(len(metaData))); err != nil {
 		return nil, err
 	}
 
 	if err := dataWriter.Flush(); err != nil {
 		return nil, err
 	}
-	if err := indexWriter.Flush(); err != nil {
-		return nil, err
-	}
 	if err := dataFile.Sync(); err != nil {
-		return nil, err
-	}
-	if err := indexFile.Sync(); err != nil {
 		return nil, err
 	}
 
@@ -132,15 +142,13 @@ func createSSTable(logger *zap.Logger, dir string, level int, id uint64, entries
 		zap.Uint64("sstable_id", id),
 		zap.Int("entries", len(entries)),
 	)
-	return &sstable{
-		id:        id,
-		level:     level,
-		dataPath:  dataPath,
-		indexPath: indexPath,
-		index:     index,
-		bloom:     filter,
-		logger:    logger,
-	}, nil
+	sst.index = index
+	sst.bloom = filter
+	if len(entries) > 0 {
+		sst.minKey = entries[0].key
+		sst.maxKey = entries[len(entries)-1].key
+	}
+	return sst, nil
 }
 
 func loadSSTable(logger *zap.Logger, dir string, level int, id uint64) (*sstable, error) {
@@ -148,33 +156,25 @@ func loadSSTable(logger *zap.Logger, dir string, level int, id uint64) (*sstable
 		logger = zap.NewNop()
 	}
 	dataPath := filepath.Join(dir, sstDataName(level, id))
-	indexPath := filepath.Join(dir, sstIndexName(level, id))
-	index, err := readIndex(indexPath)
+	sst := &sstable{
+		id:       id,
+		level:    level,
+		dataPath: dataPath,
+		logger:   logger,
+	}
+	index, filter, err := sst.readEmbeddedIndexAndBloom()
 	if err != nil {
-		return nil, err
-	}
-	filter, err := readEmbeddedBloom(dataPath)
-	if err != nil {
-		return nil, err
-	}
-	if filter == nil {
-		filter, err = readBloom(filepath.Join(dir, sstBloomName(level, id)))
-	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	logger.Info("sstable loaded",
 		zap.Uint64("sstable_id", id),
 	)
-	return &sstable{
-		id:        id,
-		level:     level,
-		dataPath:  dataPath,
-		indexPath: indexPath,
-		index:     index,
-		bloom:     filter,
-		logger:    logger,
-	}, nil
+	sst.index = index
+	sst.bloom = filter
+	if err := sst.computeKeyRange(); err != nil {
+		return nil, err
+	}
+	return sst, nil
 }
 
 func (s *sstable) get(key string) (entry, bool, error) {
@@ -210,7 +210,7 @@ func (s *sstable) get(key string) (entry, bool, error) {
 	}
 	reader := bytes.NewReader(block)
 	for reader.Len() > 0 {
-		recKey, ent, _, err := readRecord(reader)
+		recKey, ent, _, err := s.readRecord(reader)
 		if err != nil {
 			return entry{}, false, err
 		}
@@ -227,13 +227,6 @@ func (s *sstable) get(key string) (entry, bool, error) {
 
 func (s *sstable) remove() error {
 	if err := os.Remove(s.dataPath); err != nil {
-		return err
-	}
-	if err := os.Remove(s.indexPath); err != nil {
-		return err
-	}
-	bloomPath := filepath.Join(filepath.Dir(s.dataPath), sstBloomName(s.level, s.id))
-	if err := os.Remove(bloomPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -296,56 +289,34 @@ func mergeSSTables(logger *zap.Logger, dir string, level int, id uint64, tables 
 	return createSSTable(logger, dir, level, id, entries)
 }
 
-func parseSSTableName(name string) (int, uint64, bool, bool) {
+func parseSSTableName(name string) (int, uint64, bool) {
 	if !strings.HasSuffix(name, ".dat") {
-		return 0, 0, false, false
+		return 0, 0, false
 	}
 	base := strings.TrimSuffix(name, ".dat")
 	if strings.HasPrefix(base, "sst_L") {
 		parts := strings.Split(strings.TrimPrefix(base, "sst_L"), "_")
 		if len(parts) != 2 {
-			return 0, 0, false, false
+			return 0, 0, false
 		}
 		level, err := strconv.Atoi(parts[0])
 		if err != nil {
-			return 0, 0, false, false
+			return 0, 0, false
 		}
 		id, err := strconv.ParseUint(parts[1], 10, 64)
 		if err != nil {
-			return 0, 0, false, false
+			return 0, 0, false
 		}
-		return level, id, true, false
+		return level, id, true
 	}
-	if strings.HasPrefix(base, "sst_") {
-		id, err := strconv.ParseUint(strings.TrimPrefix(base, "sst_"), 10, 64)
-		if err == nil {
-			return 0, id, true, true
-		}
-	}
-	return 0, 0, false, false
+	return 0, 0, false
 }
 
 func sstDataName(level int, id uint64) string {
 	return fmt.Sprintf("sst_L%d_%06d.dat", level, id)
 }
 
-func sstIndexName(level int, id uint64) string {
-	return fmt.Sprintf("sst_L%d_%06d.idx", level, id)
-}
-
-func sstBloomName(level int, id uint64) string {
-	return fmt.Sprintf("sst_L%d_%06d.bloom", level, id)
-}
-
-func sstLegacyDataName(id uint64) string {
-	return fmt.Sprintf("sst_%06d.dat", id)
-}
-
-func sstLegacyIndexName(id uint64) string {
-	return fmt.Sprintf("sst_%06d.idx", id)
-}
-
-func writeRecord(w io.Writer, key string, ent entry) error {
+func (s *sstable) writeRecord(w io.Writer, key string, ent entry) error {
 	keyLen := uint32(len(key))
 	valLen := uint32(len(ent.value))
 	if err := binary.Write(w, binary.LittleEndian, keyLen); err != nil {
@@ -372,7 +343,7 @@ func writeRecord(w io.Writer, key string, ent entry) error {
 	return nil
 }
 
-func readRecord(r io.Reader) (string, entry, int64, error) {
+func (s *sstable) readRecord(r io.Reader) (string, entry, int64, error) {
 	var keyLen uint32
 	var valLen uint32
 	if err := binary.Read(r, binary.LittleEndian, &keyLen); err != nil {
@@ -397,10 +368,10 @@ func readRecord(r io.Reader) (string, entry, int64, error) {
 	}
 	ent := entry{value: value, tombstone: tombstoneByte == 1}
 	keyStr := string(key)
-	return keyStr, ent, recordEncodedSize(keyStr, ent), nil
+	return keyStr, ent, s.recordEncodedSize(keyStr, ent), nil
 }
 
-func writeIndexEntry(w io.Writer, key string, offset int64) error {
+func (s *sstable) writeIndexEntry(w io.Writer, key string, offset int64) error {
 	keyLen := uint32(len(key))
 	if err := binary.Write(w, binary.LittleEndian, keyLen); err != nil {
 		return err
@@ -411,14 +382,7 @@ func writeIndexEntry(w io.Writer, key string, offset int64) error {
 	return binary.Write(w, binary.LittleEndian, offset)
 }
 
-func readIndex(path string) ([]blockIndexEntry, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	reader := bufio.NewReader(file)
+func (s *sstable) readIndex(reader *bufio.Reader) ([]blockIndexEntry, error) {
 	index := make([]blockIndexEntry, 0)
 	for {
 		var keyLen uint32
@@ -441,67 +405,104 @@ func readIndex(path string) ([]blockIndexEntry, error) {
 	return index, nil
 }
 
-func readBloom(path string) (*bloomFilter, error) {
-	data, err := os.ReadFile(path)
+func (s *sstable) readEmbeddedIndexAndBloom() ([]blockIndexEntry, *bloomFilter, error) {
+	file, err := os.Open(s.dataPath)
 	if err != nil {
-		return nil, err
-	}
-	filter := decodeBloomFilter(data)
-	if filter == nil {
-		return nil, errors.New("invalid bloom filter")
-	}
-	return filter, nil
-}
-
-func readEmbeddedBloom(path string) (*bloomFilter, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if info.Size() < bloomFooterSize {
-		return nil, nil
+	if info.Size() < tableFooterSize {
+		return nil, nil, nil
 	}
-	if _, err := file.Seek(info.Size()-bloomFooterSize, io.SeekStart); err != nil {
-		return nil, err
+	if _, err := file.Seek(info.Size()-tableFooterSize, io.SeekStart); err != nil {
+		return nil, nil, err
 	}
 
-	footer := make([]byte, bloomFooterSize)
+	footer := make([]byte, tableFooterSize)
 	if _, err := io.ReadFull(file, footer); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if string(footer[:8]) != bloomFooterMagic {
-		return nil, nil
+	if string(footer[:8]) != tableFooterMagic {
+		return nil, nil, nil
 	}
-	offset := binary.LittleEndian.Uint64(footer[8:16])
-	length := binary.LittleEndian.Uint32(footer[16:20])
-	if offset > uint64(info.Size()) {
-		return nil, errors.New("invalid bloom offset")
+	metaOffset := binary.LittleEndian.Uint64(footer[8:16])
+	metaLength := binary.LittleEndian.Uint32(footer[16:20])
+	if metaOffset > uint64(info.Size()) {
+		return nil, nil, errors.New("invalid metaindex offset")
 	}
-	if uint64(length) > uint64(info.Size())-offset-uint64(bloomFooterSize) {
-		return nil, errors.New("invalid bloom length")
+	if uint64(metaLength) > uint64(info.Size())-metaOffset-uint64(tableFooterSize) {
+		return nil, nil, errors.New("invalid metaindex length")
 	}
-	if _, err := file.Seek(int64(offset), io.SeekStart); err != nil {
-		return nil, err
+	if _, err := file.Seek(int64(metaOffset), io.SeekStart); err != nil {
+		return nil, nil, err
 	}
-	data := make([]byte, length)
+	meta := make([]byte, metaLength)
+	if _, err := io.ReadFull(file, meta); err != nil {
+		return nil, nil, err
+	}
+	indexOffset, indexLength, ok, err := s.parseMetaindex(meta, "index")
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
+		return nil, nil, errors.New("missing index meta")
+	}
+	if indexOffset+uint64(indexLength) > uint64(info.Size()) {
+		return nil, nil, errors.New("invalid index range")
+	}
+	if _, err := file.Seek(int64(indexOffset), io.SeekStart); err != nil {
+		return nil, nil, err
+	}
+	indexReader := bufio.NewReader(io.LimitReader(file, int64(indexLength)))
+	index, err := s.readIndex(indexReader)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	bloomOffset, bloomLength, ok, err := s.parseMetaindex(meta, "bloom")
+	if err != nil || !ok {
+		return index, nil, err
+	}
+	if bloomOffset+uint64(bloomLength) > uint64(info.Size()) {
+		return nil, nil, errors.New("invalid bloom range")
+	}
+	if _, err := file.Seek(int64(bloomOffset), io.SeekStart); err != nil {
+		return nil, nil, err
+	}
+	data := make([]byte, bloomLength)
 	if _, err := io.ReadFull(file, data); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	filter := decodeBloomFilter(data)
 	if filter == nil {
-		return nil, nil
+		return index, nil, nil
 	}
-	return filter, nil
+	return index, filter, nil
 }
 
-func writeBloomFooter(w io.Writer, offset uint64, length uint32) error {
-	if _, err := w.Write([]byte(bloomFooterMagic)); err != nil {
+func (s *sstable) computeKeyRange() error {
+	if len(s.index) == 0 {
+		return nil
+	}
+	s.minKey = s.index[0].firstKey
+	last := s.index[len(s.index)-1]
+	keys, err := s.readBlockKeys(last.offset)
+	if err != nil {
+		return err
+	}
+	if len(keys) > 0 {
+		s.maxKey = keys[len(keys)-1]
+	}
+	return nil
+}
+
+func (s *sstable) writeTableFooter(w io.Writer, offset uint64, length uint32) error {
+	if _, err := w.Write([]byte(tableFooterMagic)); err != nil {
 		return err
 	}
 	if err := binary.Write(w, binary.LittleEndian, offset); err != nil {
@@ -510,49 +511,61 @@ func writeBloomFooter(w io.Writer, offset uint64, length uint32) error {
 	return binary.Write(w, binary.LittleEndian, length)
 }
 
-func migrateLegacySSTable(logger *zap.Logger, dir string, id uint64) (*sstable, error) {
-	if logger == nil {
-		logger = zap.NewNop()
-	}
-	legacyDataPath := filepath.Join(dir, sstLegacyDataName(id))
-	file, err := os.Open(legacyDataPath)
-	if err != nil {
+func (s *sstable) buildMetaindex(indexOffset uint64, indexLength uint32, bloomOffset uint64, bloomLength uint32) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := s.writeMetaEntry(&buf, "index", indexOffset, indexLength); err != nil {
 		return nil, err
 	}
-	defer file.Close()
-
-	reader := bufio.NewReader(file)
-	entries := make([]sstEntry, 0)
-	for {
-		key, ent, _, err := readRecord(reader)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, sstEntry{key: key, entry: ent})
-	}
-
-	sst, err := createSSTable(logger, dir, 0, id, entries)
-	if err != nil {
+	if err := s.writeMetaEntry(&buf, "bloom", bloomOffset, bloomLength); err != nil {
 		return nil, err
 	}
-	if err := os.Remove(legacyDataPath); err != nil {
-		return nil, err
-	}
-	legacyIndexPath := filepath.Join(dir, sstLegacyIndexName(id))
-	if err := os.Remove(legacyIndexPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
-	logger.Info("legacy sstable migrated",
-		zap.Uint64("sstable_id", id),
-		zap.Int("entries", len(entries)),
-	)
-	return sst, nil
+	return buf.Bytes(), nil
 }
 
-func writeBlock(w io.Writer, data []byte) error {
+func (s *sstable) parseMetaindex(meta []byte, name string) (uint64, uint32, bool, error) {
+	reader := bytes.NewReader(meta)
+	for reader.Len() > 0 {
+		var nameLen uint32
+		if err := binary.Read(reader, binary.LittleEndian, &nameLen); err != nil {
+			return 0, 0, false, err
+		}
+		if nameLen == 0 || nameLen > uint32(reader.Len()) {
+			return 0, 0, false, errors.New("invalid metaindex name length")
+		}
+		nameBytes := make([]byte, nameLen)
+		if _, err := io.ReadFull(reader, nameBytes); err != nil {
+			return 0, 0, false, err
+		}
+		var offset uint64
+		var length uint32
+		if err := binary.Read(reader, binary.LittleEndian, &offset); err != nil {
+			return 0, 0, false, err
+		}
+		if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
+			return 0, 0, false, err
+		}
+		if string(nameBytes) == name {
+			return offset, length, true, nil
+		}
+	}
+	return 0, 0, false, nil
+}
+
+func (s *sstable) writeMetaEntry(w io.Writer, name string, offset uint64, length uint32) error {
+	nameBytes := []byte(name)
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(nameBytes))); err != nil {
+		return err
+	}
+	if _, err := w.Write(nameBytes); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.LittleEndian, offset); err != nil {
+		return err
+	}
+	return binary.Write(w, binary.LittleEndian, length)
+}
+
+func (s *sstable) writeBlock(w io.Writer, data []byte) error {
 	if err := binary.Write(w, binary.LittleEndian, uint32(len(data))); err != nil {
 		return err
 	}
@@ -583,7 +596,7 @@ func (s *sstable) readBlockKeys(offset int64) ([]string, error) {
 	reader := bytes.NewReader(block)
 	keys := make([]string, 0)
 	for reader.Len() > 0 {
-		recKey, _, _, err := readRecord(reader)
+		recKey, _, _, err := s.readRecord(reader)
 		if err != nil {
 			return nil, err
 		}
@@ -592,6 +605,6 @@ func (s *sstable) readBlockKeys(offset int64) ([]string, error) {
 	return keys, nil
 }
 
-func recordEncodedSize(key string, ent entry) int64 {
+func (s *sstable) recordEncodedSize(key string, ent entry) int64 {
 	return int64(4 + 4 + 1 + len(key) + len(ent.value))
 }

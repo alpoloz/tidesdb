@@ -1,9 +1,7 @@
 # Chapter 4
 
-Multi-level compaction moves the system beyond "merge everything" behavior. Instead of collapsing all tables into one, SSTables are organized into levels (L0, L1, L2, ...), each holding a progressively more compacted view of the data. When a level grows past its limit, its tables are merged into the next level, and the process continues downstream only as needed.
+Leveled compaction organizes SSTables into tiers that get progressively more compact. New flushes land in L0. When a level grows past its limit, a subset of its tables is merged into the next level, rather than collapsing everything at once.
 
-In this implementation, new flushes land in L0. If L0 exceeds the configured table count, the tables in L0 and L1 are merged into a single new SSTable in L1. If L1 becomes too large, the merge continues into L2, and so on. This keeps write amplification controlled while avoiding the full stop-the-world merge of all tables.
+The compaction picker now chooses a table from the current level and computes its key range. Only tables in the next level that overlap that range are pulled into the merge. That keeps compactions focused, reduces write amplification, and preserves the leveled property where deeper levels become more stable and less overlapping.
 
-The file layout reflects this structure: tables are named with a level prefix (`sst_L{level}_{id}.*`), which makes it easy to load level metadata on startup. Reads still check newer tables first, but the leveled layout sets the stage for more nuanced policies later (overlap tracking, size-based targets, and background compaction).
-
-This is still a deliberately simple version of leveled compaction, but it establishes the right shape for a more LevelDB-like strategy.
+Reads still consult newer levels first, but the overlap-aware merges make it cheaper to keep older levels compact. This is a foundational version of leveled compaction: it does not yet track file sizes or use a scoring system, but it moves the system away from full-level merges and toward more surgical compactions.

@@ -235,16 +235,24 @@ func (db *DB) compactLocked(level int) error {
 		nextLevel := level + 1
 		db.ensureLevel(nextLevel)
 
-		tables := append([]*sstable(nil), db.sstables[level]...)
-		tables = append(tables, db.sstables[nextLevel]...)
-		if len(tables) < 2 {
+		pick := db.pickCompactionInputs(level)
+		if len(pick) == 0 {
+			return nil
+		}
+		minKey, maxKey := tableRange(pick)
+		overlaps := db.overlappingTables(nextLevel, minKey, maxKey)
+
+		tables := append([]*sstable(nil), pick...)
+		tables = append(tables, overlaps...)
+		if len(tables) < 1 {
 			return nil
 		}
 
 		db.logger.Info("compaction started",
 			zap.Int("level", level),
 			zap.Int("next_level", nextLevel),
-			zap.Int("tables", len(tables)),
+			zap.Int("inputs", len(pick)),
+			zap.Int("overlaps", len(overlaps)),
 		)
 
 		merged, err := mergeSSTables(db.logger, db.path, nextLevel, db.nextSSTID, tables)
@@ -256,8 +264,9 @@ func (db *DB) compactLocked(level int) error {
 				return err
 			}
 		}
-		db.sstables[level] = nil
-		db.sstables[nextLevel] = []*sstable{merged}
+		db.sstables[level] = removeTables(db.sstables[level], pick)
+		db.sstables[nextLevel] = removeTables(db.sstables[nextLevel], overlaps)
+		db.sstables[nextLevel] = append(db.sstables[nextLevel], merged)
 		db.nextSSTID++
 
 		db.logger.Info("compaction finished",
@@ -278,14 +287,9 @@ func (db *DB) loadSSTables() error {
 	}
 
 	byLevel := map[int][]uint64{}
-	var legacyIDs []uint64
 	for _, entry := range entries {
-		level, id, ok, legacy := parseSSTableName(entry.Name())
+		level, id, ok := parseSSTableName(entry.Name())
 		if ok {
-			if legacy {
-				legacyIDs = append(legacyIDs, id)
-				continue
-			}
 			byLevel[level] = append(byLevel[level], id)
 		}
 	}
@@ -299,18 +303,6 @@ func (db *DB) loadSSTables() error {
 				return err
 			}
 			db.sstables[level] = append(db.sstables[level], sst)
-			db.nextSSTID = max(db.nextSSTID, id+1)
-		}
-	}
-	if len(legacyIDs) > 0 {
-		sort.Slice(legacyIDs, func(i, j int) bool { return legacyIDs[i] < legacyIDs[j] })
-		db.ensureLevel(0)
-		for _, id := range legacyIDs {
-			sst, err := migrateLegacySSTable(db.logger, db.path, id)
-			if err != nil {
-				return err
-			}
-			db.sstables[0] = append(db.sstables[0], sst)
 			db.nextSSTID = max(db.nextSSTID, id+1)
 		}
 	}
@@ -374,4 +366,75 @@ func (db *DB) snapshotSSTables() [][]*sstable {
 		result[i] = append([]*sstable(nil), db.sstables[i]...)
 	}
 	return result
+}
+
+func (db *DB) pickCompactionInputs(level int) []*sstable {
+	if len(db.sstables[level]) == 0 {
+		return nil
+	}
+	return []*sstable{db.sstables[level][0]}
+}
+
+func (db *DB) overlappingTables(level int, minKey, maxKey string) []*sstable {
+	if minKey == "" && maxKey == "" {
+		return nil
+	}
+	var overlaps []*sstable
+	for _, sst := range db.sstables[level] {
+		if rangesOverlap(minKey, maxKey, sst.minKey, sst.maxKey) {
+			overlaps = append(overlaps, sst)
+		}
+	}
+	return overlaps
+}
+
+func rangesOverlap(minA, maxA, minB, maxB string) bool {
+	if minA == "" && maxA == "" {
+		return false
+	}
+	if minB == "" && maxB == "" {
+		return false
+	}
+	if maxA < minB || maxB < minA {
+		return false
+	}
+	return true
+}
+
+func tableRange(tables []*sstable) (string, string) {
+	if len(tables) == 0 {
+		return "", ""
+	}
+	minKey := ""
+	maxKey := ""
+	for _, sst := range tables {
+		if sst.minKey == "" && sst.maxKey == "" {
+			continue
+		}
+		if minKey == "" || sst.minKey < minKey {
+			minKey = sst.minKey
+		}
+		if maxKey == "" || sst.maxKey > maxKey {
+			maxKey = sst.maxKey
+		}
+	}
+	return minKey, maxKey
+}
+
+func removeTables(all []*sstable, remove []*sstable) []*sstable {
+	if len(remove) == 0 {
+		return all
+	}
+	removeSet := make(map[*sstable]struct{}, len(remove))
+	for _, sst := range remove {
+		removeSet[sst] = struct{}{}
+	}
+	out := make([]*sstable, 0, len(all))
+	for _, sst := range all {
+		if _, ok := removeSet[sst]; ok {
+			continue
+		}
+		out = append(out, sst)
+	}
+	return out
 }

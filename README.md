@@ -1,10 +1,10 @@
 # tidesdb
 
-Simple, persistent key-value store powered by an LSM-tree architecture. Designed as a compact, readable implementation inspired by LevelDB's core ideas: WAL + memtable + immutable SSTables with compaction.
+Simple, persistent key-value store powered by an LSM-tree architecture. Designed as a compact, readable implementation with WAL + memtable + immutable SSTables with compaction.
 
 ## Architecture
 
-This implementation mirrors the core LevelDB-style flow while keeping the code intentionally small and readable.
+This implementation mirrors the core LSM flow while keeping the code intentionally small and readable.
 
 1. **WAL (write-ahead log)**: Every `Put` and `Delete` is appended to `wal.log` before touching memory. On restart, the WAL is replayed to rebuild the memtable.
 2. **Memtable**: In-memory map storing the latest key state (value or tombstone). When it grows beyond a threshold, it is flushed to disk.
