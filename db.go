@@ -40,6 +40,7 @@ type DB struct {
 	wal       *wal
 	sstables  [][]*sstable
 	nextSSTID uint64
+	seq       uint64
 	logger    *zap.Logger
 }
 
@@ -85,6 +86,10 @@ func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
 		sstables: make([][]*sstable, options.MaxLevels),
 	}
 
+	if err := db.loadSeq(); err != nil {
+		_ = w.Close()
+		return nil, err
+	}
 	if err := db.loadSSTables(); err != nil {
 		_ = w.Close()
 		return nil, err
@@ -112,10 +117,15 @@ func (db *DB) Put(key string, value []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := db.wal.appendRecord(walOpPut, key, valCopy); err != nil {
+	seq := db.seq + 1
+	if err := db.wal.appendRecord(walOpPut, seq, key, valCopy); err != nil {
 		return err
 	}
-	db.insertMemtable(key, entry{value: valCopy})
+	db.seq = seq
+	if err := db.storeSeq(); err != nil {
+		return err
+	}
+	db.insertMemtable(key, entry{value: valCopy}, seq, valueKindPut)
 
 	if db.memBytes >= db.opts.MemtableMaxBytes {
 		return db.flushLocked()
@@ -131,10 +141,15 @@ func (db *DB) Delete(key string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := db.wal.appendRecord(walOpDelete, key, nil); err != nil {
+	seq := db.seq + 1
+	if err := db.wal.appendRecord(walOpDelete, seq, key, nil); err != nil {
 		return err
 	}
-	db.insertMemtable(key, entry{tombstone: true})
+	db.seq = seq
+	if err := db.storeSeq(); err != nil {
+		return err
+	}
+	db.insertMemtable(key, entry{tombstone: true}, seq, valueKindDelete)
 
 	if db.memBytes >= db.opts.MemtableMaxBytes {
 		return db.flushLocked()
@@ -185,8 +200,9 @@ func (db *DB) Close() error {
 	return db.wal.Close()
 }
 
-func (db *DB) insertMemtable(key string, ent entry) {
-	db.memtable.set(key, ent)
+func (db *DB) insertMemtable(key string, ent entry, seq uint64, kind valueKind) {
+	internalKey := encodeInternalKey(key, seq, kind)
+	db.memtable.set(internalKey, ent)
 	db.memBytes = db.memtable.bytesUsed()
 }
 
@@ -325,21 +341,20 @@ func (db *DB) replayWAL() error {
 	for _, rec := range records {
 		switch rec.op {
 		case walOpPut:
-			db.insertMemtable(rec.key, entry{value: rec.value})
+			db.insertMemtable(rec.key, entry{value: rec.value}, rec.seq, valueKindPut)
 		case walOpDelete:
-			db.insertMemtable(rec.key, entry{tombstone: true})
+			db.insertMemtable(rec.key, entry{tombstone: true}, rec.seq, valueKindDelete)
 		default:
 			return fmt.Errorf("unknown wal op %d", rec.op)
 		}
+		if rec.seq > db.seq {
+			db.seq = rec.seq
+		}
+	}
+	if err := db.storeSeq(); err != nil {
+		return err
 	}
 	return nil
-}
-
-func max(a, b uint64) uint64 {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func (db *DB) ensureLevel(level int) {
@@ -366,6 +381,24 @@ func (db *DB) snapshotSSTables() [][]*sstable {
 		result[i] = append([]*sstable(nil), db.sstables[i]...)
 	}
 	return result
+}
+
+func (db *DB) loadSeq() error {
+	path := filepath.Join(db.path, "seq.meta")
+	seq, err := readSeqMeta(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	db.seq = seq
+	return nil
+}
+
+func (db *DB) storeSeq() error {
+	path := filepath.Join(db.path, "seq.meta")
+	return writeSeqMeta(path, db.seq)
 }
 
 func (db *DB) pickCompactionInputs(level int) []*sstable {

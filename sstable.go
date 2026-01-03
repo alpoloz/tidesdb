@@ -99,7 +99,9 @@ func createSSTable(logger *zap.Logger, dir string, level int, id uint64, entries
 		if err := sst.writeRecord(&blockBuf, item.key, item.entry); err != nil {
 			return nil, err
 		}
-		filter.add(item.key)
+		if userKey, _, _, ok := decodeInternalKey([]byte(item.key)); ok {
+			filter.add(userKey)
+		}
 	}
 	if err := flushBlock(); err != nil {
 		return nil, err
@@ -145,8 +147,12 @@ func createSSTable(logger *zap.Logger, dir string, level int, id uint64, entries
 	sst.index = index
 	sst.bloom = filter
 	if len(entries) > 0 {
-		sst.minKey = entries[0].key
-		sst.maxKey = entries[len(entries)-1].key
+		if userKey, _, _, ok := decodeInternalKey([]byte(entries[0].key)); ok {
+			sst.minKey = userKey
+		}
+		if userKey, _, _, ok := decodeInternalKey([]byte(entries[len(entries)-1].key)); ok {
+			sst.maxKey = userKey
+		}
 	}
 	return sst, nil
 }
@@ -184,8 +190,9 @@ func (s *sstable) get(key string) (entry, bool, error) {
 	if len(s.index) == 0 {
 		return entry{}, false, nil
 	}
+	seekKey := encodeInternalKey(key, ^uint64(0), valueKindPut)
 	pos := sort.Search(len(s.index), func(i int) bool {
-		return s.index[i].firstKey > key
+		return compareInternalKeyStrings(s.index[i].firstKey, string(seekKey)) > 0
 	})
 	blockIdx := pos - 1
 	if blockIdx < 0 {
@@ -214,7 +221,11 @@ func (s *sstable) get(key string) (entry, bool, error) {
 		if err != nil {
 			return entry{}, false, err
 		}
-		cmp := strings.Compare(recKey, key)
+		userKey, _, _, ok := decodeInternalKey([]byte(recKey))
+		if !ok {
+			continue
+		}
+		cmp := strings.Compare(userKey, key)
 		if cmp == 0 {
 			return ent, true, nil
 		}
@@ -236,50 +247,38 @@ func mergeSSTables(logger *zap.Logger, dir string, level int, id uint64, tables 
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	type tableKey struct {
-		key string
-		idx int
+	type bestEntry struct {
+		seq  uint64
+		ikey string
+		ent  entry
 	}
-
-	keysMap := make(map[string]int)
-	for i, sst := range tables {
-		for _, block := range sst.index {
-			blockKeys, err := sst.readBlockKeys(block.offset)
-			if err != nil {
-				return nil, err
-			}
-			for _, key := range blockKeys {
-				if existing, ok := keysMap[key]; ok {
-					if existing < i {
-						keysMap[key] = i
-					}
-					continue
-				}
-				keysMap[key] = i
-			}
-		}
-	}
-
-	var keyList []tableKey
-	for key, idx := range keysMap {
-		keyList = append(keyList, tableKey{key: key, idx: idx})
-	}
-	sort.Slice(keyList, func(i, j int) bool { return keyList[i].key < keyList[j].key })
-
-	entries := make([]sstEntry, 0, len(keyList))
-	for _, item := range keyList {
-		ent, ok, err := tables[item.idx].get(item.key)
+	best := make(map[string]bestEntry)
+	for _, sst := range tables {
+		entries, err := sst.readAllEntries()
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			return nil, errors.New("missing key during compaction")
+		for _, item := range entries {
+			userKey, seq, _, ok := decodeInternalKey([]byte(item.key))
+			if !ok {
+				continue
+			}
+			if current, exists := best[userKey]; exists {
+				if seq <= current.seq {
+					continue
+				}
+			}
+			best[userKey] = bestEntry{seq: seq, ikey: item.key, ent: item.entry}
 		}
-		if ent.tombstone {
-			continue
-		}
-		entries = append(entries, sstEntry{key: item.key, entry: ent})
 	}
+
+	entries := make([]sstEntry, 0, len(best))
+	for _, item := range best {
+		entries = append(entries, sstEntry{key: item.ikey, entry: item.ent})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return compareInternalKeyStrings(entries[i].key, entries[j].key) < 0
+	})
 
 	logger.Info("sstable merge",
 		zap.Uint64("sstable_id", id),
@@ -489,14 +488,18 @@ func (s *sstable) computeKeyRange() error {
 	if len(s.index) == 0 {
 		return nil
 	}
-	s.minKey = s.index[0].firstKey
+	if userKey, _, _, ok := decodeInternalKey([]byte(s.index[0].firstKey)); ok {
+		s.minKey = userKey
+	}
 	last := s.index[len(s.index)-1]
 	keys, err := s.readBlockKeys(last.offset)
 	if err != nil {
 		return err
 	}
 	if len(keys) > 0 {
-		s.maxKey = keys[len(keys)-1]
+		if userKey, _, _, ok := decodeInternalKey([]byte(keys[len(keys)-1])); ok {
+			s.maxKey = userKey
+		}
 	}
 	return nil
 }
@@ -603,6 +606,38 @@ func (s *sstable) readBlockKeys(offset int64) ([]string, error) {
 		keys = append(keys, recKey)
 	}
 	return keys, nil
+}
+
+func (s *sstable) readAllEntries() ([]sstEntry, error) {
+	file, err := os.Open(s.dataPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	entries := make([]sstEntry, 0)
+	for _, block := range s.index {
+		if _, err := file.Seek(block.offset, io.SeekStart); err != nil {
+			return nil, err
+		}
+		var blockLen uint32
+		if err := binary.Read(file, binary.LittleEndian, &blockLen); err != nil {
+			return nil, err
+		}
+		blockData := make([]byte, blockLen)
+		if _, err := io.ReadFull(file, blockData); err != nil {
+			return nil, err
+		}
+		reader := bytes.NewReader(blockData)
+		for reader.Len() > 0 {
+			recKey, ent, _, err := s.readRecord(reader)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, sstEntry{key: recKey, entry: ent})
+		}
+	}
+	return entries, nil
 }
 
 func (s *sstable) recordEncodedSize(key string, ent entry) int64 {

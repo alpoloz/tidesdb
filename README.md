@@ -66,51 +66,6 @@ func main() {
 }
 ```
 
-### Persistence
-
-```go
-package main
-
-import (
-	"fmt"
-	"log"
-
-	"tidesdb"
-	"go.uber.org/zap"
-)
-
-func main() {
-	logger, err := zap.NewDevelopment()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func() {
-		_ = logger.Sync()
-	}()
-
-	db, err := tidesdb.Open(logger, "data", nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := db.Put("session", []byte("abc123")); err != nil {
-		log.Fatal(err)
-	}
-	_ = db.Close()
-
-	db, err = tidesdb.Open(logger, "data", nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
-	value, err := db.Get("session")
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(string(value))
-}
-```
-
 ### Custom options
 
 ```go

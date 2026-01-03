@@ -16,13 +16,13 @@ type memtable struct {
 
 func newMemtable() *memtable {
 	return &memtable{
-		list:  newSkiplist(defaultSkiplistHeight),
+		list:  newSkiplist(defaultSkiplistHeight, compareInternalKeys),
 		arena: newArena(defaultArenaBlockSize),
 	}
 }
 
-func (m *memtable) set(key string, ent entry) {
-	keyBytes := m.arena.putBytes([]byte(key))
+func (m *memtable) set(internalKey []byte, ent entry) {
+	keyBytes := m.arena.putBytes(internalKey)
 	valueBytes := []byte(nil)
 	if len(ent.value) > 0 {
 		valueBytes = m.arena.putBytes(ent.value)
@@ -30,10 +30,14 @@ func (m *memtable) set(key string, ent entry) {
 	m.list.insertOrUpdate(keyBytes, valueBytes, ent.tombstone)
 }
 
-func (m *memtable) get(key string) (entry, bool) {
-	keyBytes := []byte(key)
-	node := m.list.find(keyBytes)
+func (m *memtable) get(userKey string) (entry, bool) {
+	seekKey := encodeInternalKey(userKey, ^uint64(0), valueKindPut)
+	node := m.list.findGreaterOrEqual(seekKey)
 	if node == nil {
+		return entry{}, false
+	}
+	decodedUser, _, _, ok := decodeInternalKey(node.key)
+	if !ok || decodedUser != userKey {
 		return entry{}, false
 	}
 	return entry{value: node.value, tombstone: node.tombstone}, true
@@ -107,6 +111,7 @@ type skiplist struct {
 	height    int
 	rnd       uint32
 	length    int
+	compare   func(a, b []byte) int
 }
 
 type skiplistNode struct {
@@ -116,12 +121,15 @@ type skiplistNode struct {
 	next      []*skiplistNode
 }
 
-func newSkiplist(maxHeight int) *skiplist {
+func newSkiplist(maxHeight int, compare func(a, b []byte) int) *skiplist {
 	if maxHeight <= 0 {
 		maxHeight = defaultSkiplistHeight
 	}
+	if compare == nil {
+		compare = bytes.Compare
+	}
 	head := &skiplistNode{next: make([]*skiplistNode, maxHeight)}
-	return &skiplist{head: head, maxHeight: maxHeight, height: 1, rnd: 0xdeadbeef}
+	return &skiplist{head: head, maxHeight: maxHeight, height: 1, rnd: 0xdeadbeef, compare: compare}
 }
 
 func (s *skiplist) len() int {
@@ -131,28 +139,38 @@ func (s *skiplist) len() int {
 func (s *skiplist) find(key []byte) *skiplistNode {
 	x := s.head
 	for level := s.height - 1; level >= 0; level-- {
-		for next := x.next[level]; next != nil && bytes.Compare(next.key, key) < 0; next = x.next[level] {
+		for next := x.next[level]; next != nil && s.compare(next.key, key) < 0; next = x.next[level] {
 			x = next
 		}
 	}
 	x = x.next[0]
-	if x != nil && bytes.Equal(x.key, key) {
+	if x != nil && s.compare(x.key, key) == 0 {
 		return x
 	}
 	return nil
+}
+
+func (s *skiplist) findGreaterOrEqual(key []byte) *skiplistNode {
+	x := s.head
+	for level := s.height - 1; level >= 0; level-- {
+		for next := x.next[level]; next != nil && s.compare(next.key, key) < 0; next = x.next[level] {
+			x = next
+		}
+	}
+	return x.next[0]
 }
 
 func (s *skiplist) insertOrUpdate(key []byte, value []byte, tombstone bool) {
 	update := make([]*skiplistNode, s.maxHeight)
 	x := s.head
 	for level := s.height - 1; level >= 0; level-- {
-		for next := x.next[level]; next != nil && bytes.Compare(next.key, key) < 0; next = x.next[level] {
+		for next := x.next[level]; next != nil && s.compare(next.key, key) < 0; next = x.next[level] {
 			x = next
 		}
 		update[level] = x
 	}
 	x = x.next[0]
-	if x != nil && bytes.Equal(x.key, key) {
+	if x != nil && s.compare(x.key, key) == 0 {
 		x.value = value
 		x.tombstone = tombstone
 		return

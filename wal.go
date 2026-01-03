@@ -18,6 +18,7 @@ const (
 
 type walRecord struct {
 	op    walOp
+	seq   uint64
 	key   string
 	value []byte
 }
@@ -44,8 +45,11 @@ func openWAL(logger *zap.Logger, path string) (*wal, error) {
 	return &wal{file: file, buf: bufio.NewWriter(file), logger: logger}, nil
 }
 
-func (w *wal) appendRecord(op walOp, key string, value []byte) error {
+func (w *wal) appendRecord(op walOp, seq uint64, key string, value []byte) error {
 	if err := binary.Write(w.buf, binary.LittleEndian, op); err != nil {
+		return err
+	}
+	if err := binary.Write(w.buf, binary.LittleEndian, seq); err != nil {
 		return err
 	}
 	keyLen := uint32(len(key))
@@ -91,6 +95,10 @@ func (w *wal) readAll() ([]walRecord, error) {
 		if err != nil {
 			return nil, err
 		}
+		var seq uint64
+		if err := binary.Read(reader, binary.LittleEndian, &seq); err != nil {
+			return nil, err
+		}
 		var keyLen uint32
 		var valLen uint32
 		if err := binary.Read(reader, binary.LittleEndian, &keyLen); err != nil {
@@ -109,7 +117,7 @@ func (w *wal) readAll() ([]walRecord, error) {
 				return nil, err
 			}
 		}
-		records = append(records, walRecord{op: walOp(opByte), key: string(key), value: value})
+		records = append(records, walRecord{op: walOp(opByte), seq: seq, key: string(key), value: value})
 	}
 	return records, nil
 }
