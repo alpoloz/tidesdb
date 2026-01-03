@@ -27,6 +27,7 @@ type wal struct {
 	file   *os.File
 	buf    *bufio.Writer
 	logger *zap.Logger
+	path   string
 }
 
 func openWAL(logger *zap.Logger, path string) (*wal, error) {
@@ -42,7 +43,7 @@ func openWAL(logger *zap.Logger, path string) (*wal, error) {
 		return nil, err
 	}
 	logger.Info("wal opened", zap.String("path", path))
-	return &wal{file: file, buf: bufio.NewWriter(file), logger: logger}, nil
+	return &wal{file: file, buf: bufio.NewWriter(file), logger: logger, path: path}, nil
 }
 
 func (w *wal) appendRecord(op walOp, seq uint64, key string, value []byte) error {
@@ -144,4 +145,48 @@ func (w *wal) Close() error {
 		return err
 	}
 	return w.file.Close()
+}
+
+func readWALRecords(path string) ([]walRecord, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	var records []walRecord
+	for {
+		opByte, err := reader.ReadByte()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		var seq uint64
+		if err := binary.Read(reader, binary.LittleEndian, &seq); err != nil {
+			return nil, err
+		}
+		var keyLen uint32
+		var valLen uint32
+		if err := binary.Read(reader, binary.LittleEndian, &keyLen); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(reader, binary.LittleEndian, &valLen); err != nil {
+			return nil, err
+		}
+		key := make([]byte, keyLen)
+		if _, err := io.ReadFull(reader, key); err != nil {
+			return nil, err
+		}
+		value := make([]byte, valLen)
+		if valLen > 0 {
+			if _, err := io.ReadFull(reader, value); err != nil {
+				return nil, err
+			}
+		}
+		records = append(records, walRecord{op: walOp(opByte), seq: seq, key: string(key), value: value})
+	}
+	return records, nil
 }

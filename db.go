@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 
 	"go.uber.org/zap"
@@ -38,10 +40,13 @@ type DB struct {
 	memtable  *memtable
 	memBytes  int
 	wal       *wal
+	walID     uint64
 	sstables  [][]*sstable
 	nextSSTID uint64
 	seq       uint64
 	logger    *zap.Logger
+	bgTasks   chan any
+	bgWG      sync.WaitGroup
 }
 
 func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
@@ -84,9 +89,17 @@ func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
 		wal:      w,
 		logger:   logger,
 		sstables: make([][]*sstable, options.MaxLevels),
+		bgTasks:  make(chan any, 16),
 	}
 
+	db.bgWG.Add(1)
+	go db.runBackground()
+
 	if err := db.loadSeq(); err != nil {
+		_ = w.Close()
+		return nil, err
+	}
+	if err := db.loadWALID(); err != nil {
 		_ = w.Close()
 		return nil, err
 	}
@@ -196,6 +209,20 @@ func (db *DB) Get(key string) ([]byte, error) {
 
 func (db *DB) Close() error {
 	db.mu.Lock()
+	if db.memtable.len() > 0 {
+		if err := db.flushLocked(); err != nil {
+			db.mu.Unlock()
+			return err
+		}
+	}
+	if db.bgTasks != nil {
+		close(db.bgTasks)
+		db.bgTasks = nil
+	}
+	db.mu.Unlock()
+
+	db.bgWG.Wait()
+	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.wal.Close()
 }
@@ -212,87 +239,36 @@ func (db *DB) flushLocked() error {
 	}
 
 	entries := db.memtable.entries()
-
-	id := db.nextSSTID
-	db.nextSSTID++
+	walPath := db.wal.path
+	rotatedPath := filepath.Join(db.path, fmt.Sprintf("wal_%06d.log", db.walID))
+	db.walID++
 
 	db.logger.Info("flushing memtable",
-		zap.Uint64("sstable_id", id),
 		zap.Int("entries", len(entries)),
 		zap.Int("mem_bytes", db.memBytes),
 	)
 
-	sst, err := createSSTable(db.logger, db.path, 0, id, entries)
+	if err := db.wal.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(walPath, rotatedPath); err != nil {
+		return err
+	}
+	w, err := openWAL(db.logger, filepath.Join(db.path, "wal.log"))
 	if err != nil {
 		return err
 	}
-	if err := db.wal.reset(); err != nil {
-		return err
-	}
+	db.wal = w
 
-	db.sstables[0] = append(db.sstables[0], sst)
 	db.memtable = newMemtable()
 	db.memBytes = 0
 
+	db.enqueueTask(flushTask{entries: entries, walPath: rotatedPath})
+
 	if len(db.sstables[0]) > db.opts.MaxSSTables {
-		if err := db.compactLocked(0); err != nil {
-			return err
-		}
+		db.enqueueTask(compactionTask{level: 0})
 	}
 
-	return nil
-}
-
-func (db *DB) compactLocked(level int) error {
-	for level < len(db.sstables) {
-		if len(db.sstables[level]) <= db.opts.MaxSSTables {
-			return nil
-		}
-		nextLevel := level + 1
-		db.ensureLevel(nextLevel)
-
-		pick := db.pickCompactionInputs(level)
-		if len(pick) == 0 {
-			return nil
-		}
-		minKey, maxKey := tableRange(pick)
-		overlaps := db.overlappingTables(nextLevel, minKey, maxKey)
-
-		tables := append([]*sstable(nil), pick...)
-		tables = append(tables, overlaps...)
-		if len(tables) < 1 {
-			return nil
-		}
-
-		db.logger.Info("compaction started",
-			zap.Int("level", level),
-			zap.Int("next_level", nextLevel),
-			zap.Int("inputs", len(pick)),
-			zap.Int("overlaps", len(overlaps)),
-		)
-
-		merged, err := mergeSSTables(db.logger, db.path, nextLevel, db.nextSSTID, tables)
-		if err != nil {
-			return err
-		}
-		for _, sst := range tables {
-			if err := sst.remove(); err != nil {
-				return err
-			}
-		}
-		db.sstables[level] = removeTables(db.sstables[level], pick)
-		db.sstables[nextLevel] = removeTables(db.sstables[nextLevel], overlaps)
-		db.sstables[nextLevel] = append(db.sstables[nextLevel], merged)
-		db.nextSSTID++
-
-		db.logger.Info("compaction finished",
-			zap.Int("level", level),
-			zap.Int("next_level", nextLevel),
-			zap.Uint64("sstable_id", merged.id),
-		)
-
-		level = nextLevel
-	}
 	return nil
 }
 
@@ -329,9 +305,18 @@ func (db *DB) loadSSTables() error {
 }
 
 func (db *DB) replayWAL() error {
-	records, err := db.wal.readAll()
+	walFiles, err := db.listWALFiles()
 	if err != nil {
 		return err
+	}
+
+	var records []walRecord
+	for _, path := range walFiles {
+		recs, err := readWALRecords(path)
+		if err != nil {
+			return err
+		}
+		records = append(records, recs...)
 	}
 	if len(records) > 0 {
 		db.logger.Info("wal replay",
@@ -381,6 +366,151 @@ func (db *DB) snapshotSSTables() [][]*sstable {
 		result[i] = append([]*sstable(nil), db.sstables[i]...)
 	}
 	return result
+}
+
+type flushTask struct {
+	entries []sstEntry
+	walPath string
+}
+
+type compactionTask struct {
+	level int
+}
+
+func (db *DB) enqueueTask(task any) {
+	if db.bgTasks == nil {
+		return
+	}
+	db.bgTasks <- task
+}
+
+func (db *DB) runBackground() {
+	defer db.bgWG.Done()
+	for task := range db.bgTasks {
+		switch t := task.(type) {
+		case flushTask:
+			db.processFlush(t)
+		case compactionTask:
+			db.processCompaction(t.level)
+		}
+	}
+}
+
+func (db *DB) processFlush(task flushTask) {
+	db.mu.Lock()
+	id := db.nextSSTID
+	db.nextSSTID++
+	db.mu.Unlock()
+
+	sst, err := createSSTable(db.logger, db.path, 0, id, task.entries)
+	if err != nil {
+		db.logger.Error("flush failed", zap.Error(err))
+		return
+	}
+
+	db.mu.Lock()
+	db.sstables[0] = append(db.sstables[0], sst)
+	needCompact := len(db.sstables[0]) > db.opts.MaxSSTables
+	db.mu.Unlock()
+
+	if err := os.Remove(task.walPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		db.logger.Warn("wal cleanup failed", zap.String("path", task.walPath), zap.Error(err))
+	}
+	if needCompact {
+		db.enqueueTask(compactionTask{level: 0})
+	}
+}
+
+func (db *DB) processCompaction(level int) {
+	db.mu.Lock()
+	if level >= len(db.sstables) {
+		db.mu.Unlock()
+		return
+	}
+	db.ensureLevel(level + 1)
+	pick := db.pickCompactionInputs(level)
+	if len(pick) == 0 {
+		db.mu.Unlock()
+		return
+	}
+	minKey, maxKey := tableRange(pick)
+	overlaps := db.overlappingTables(level+1, minKey, maxKey)
+	tables := append([]*sstable(nil), pick...)
+	tables = append(tables, overlaps...)
+	id := db.nextSSTID
+	db.nextSSTID++
+	db.mu.Unlock()
+
+	if len(tables) == 0 {
+		return
+	}
+
+	db.logger.Info("compaction started",
+		zap.Int("level", level),
+		zap.Int("next_level", level+1),
+		zap.Int("inputs", len(pick)),
+		zap.Int("overlaps", len(overlaps)),
+	)
+
+	merged, err := mergeSSTables(db.logger, db.path, level+1, id, tables)
+	if err != nil {
+		db.logger.Error("compaction failed", zap.Error(err))
+		return
+	}
+
+	db.mu.Lock()
+	db.sstables[level] = removeTables(db.sstables[level], pick)
+	db.sstables[level+1] = removeTables(db.sstables[level+1], overlaps)
+	db.sstables[level+1] = append(db.sstables[level+1], merged)
+	db.mu.Unlock()
+
+	for _, sst := range tables {
+		if err := sst.remove(); err != nil {
+			db.logger.Warn("sstable cleanup failed", zap.Error(err))
+		}
+	}
+
+	db.logger.Info("compaction finished",
+		zap.Int("level", level),
+		zap.Int("next_level", level+1),
+		zap.Uint64("sstable_id", merged.id),
+	)
+}
+
+func (db *DB) listWALFiles() ([]string, error) {
+	entries, err := os.ReadDir(db.path)
+	if err != nil {
+		return nil, err
+	}
+	var walFiles []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == "wal.log" || strings.HasPrefix(name, "wal_") && strings.HasSuffix(name, ".log") {
+			walFiles = append(walFiles, filepath.Join(db.path, name))
+		}
+	}
+	sort.Strings(walFiles)
+	return walFiles, nil
+}
+
+func (db *DB) loadWALID() error {
+	entries, err := os.ReadDir(db.path)
+	if err != nil {
+		return err
+	}
+	var maxID uint64
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, "wal_") && strings.HasSuffix(name, ".log") {
+			base := strings.TrimSuffix(strings.TrimPrefix(name, "wal_"), ".log")
+			id, err := strconv.ParseUint(base, 10, 64)
+			if err == nil && id > maxID {
+				maxID = id
+			}
+		}
+	}
+	db.walID = maxID + 1
+	return nil
 }
 
 func (db *DB) loadSeq() error {
