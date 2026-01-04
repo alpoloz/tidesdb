@@ -184,13 +184,17 @@ func loadSSTable(logger *zap.Logger, dir string, level int, id uint64) (*sstable
 }
 
 func (s *sstable) get(key string) (entry, bool, error) {
+	return s.getAt(key, ^uint64(0))
+}
+
+func (s *sstable) getAt(key string, seq uint64) (entry, bool, error) {
 	if s.bloom != nil && !s.bloom.mayContain(key) {
 		return entry{}, false, nil
 	}
 	if len(s.index) == 0 {
 		return entry{}, false, nil
 	}
-	seekKey := encodeInternalKey(key, ^uint64(0), valueKindPut)
+	seekKey := encodeInternalKey(key, seq, valueKindPut)
 	pos := sort.Search(len(s.index), func(i int) bool {
 		return compareInternalKeyStrings(s.index[i].firstKey, string(seekKey)) > 0
 	})
@@ -221,13 +225,16 @@ func (s *sstable) get(key string) (entry, bool, error) {
 		if err != nil {
 			return entry{}, false, err
 		}
-		userKey, _, _, ok := decodeInternalKey([]byte(recKey))
+		userKey, recSeq, _, ok := decodeInternalKey([]byte(recKey))
 		if !ok {
 			continue
 		}
 		cmp := strings.Compare(userKey, key)
 		if cmp == 0 {
-			return ent, true, nil
+			if recSeq <= seq {
+				return ent, true, nil
+			}
+			continue
 		}
 		if cmp > 0 {
 			return entry{}, false, nil
@@ -247,34 +254,13 @@ func mergeSSTables(logger *zap.Logger, dir string, level int, id uint64, tables 
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	type bestEntry struct {
-		seq  uint64
-		ikey string
-		ent  entry
-	}
-	best := make(map[string]bestEntry)
+	entries := make([]sstEntry, 0)
 	for _, sst := range tables {
-		entries, err := sst.readAllEntries()
+		tableEntries, err := sst.readAllEntries()
 		if err != nil {
 			return nil, err
 		}
-		for _, item := range entries {
-			userKey, seq, _, ok := decodeInternalKey([]byte(item.key))
-			if !ok {
-				continue
-			}
-			if current, exists := best[userKey]; exists {
-				if seq <= current.seq {
-					continue
-				}
-			}
-			best[userKey] = bestEntry{seq: seq, ikey: item.key, ent: item.entry}
-		}
-	}
-
-	entries := make([]sstEntry, 0, len(best))
-	for _, item := range best {
-		entries = append(entries, sstEntry{key: item.ikey, entry: item.ent})
+		entries = append(entries, tableEntries...)
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		return compareInternalKeyStrings(entries[i].key, entries[j].key) < 0

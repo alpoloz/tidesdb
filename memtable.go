@@ -31,13 +31,20 @@ func (m *memtable) set(internalKey []byte, ent entry) {
 }
 
 func (m *memtable) get(userKey string) (entry, bool) {
-	seekKey := encodeInternalKey(userKey, ^uint64(0), valueKindPut)
+	return m.getAt(userKey, ^uint64(0))
+}
+
+func (m *memtable) getAt(userKey string, seq uint64) (entry, bool) {
+	seekKey := encodeInternalKey(userKey, seq, valueKindPut)
 	node := m.list.findGreaterOrEqual(seekKey)
 	if node == nil {
 		return entry{}, false
 	}
-	decodedUser, _, _, ok := decodeInternalKey(node.key)
+	decodedUser, decodedSeq, _, ok := decodeInternalKey(node.key)
 	if !ok || decodedUser != userKey {
+		return entry{}, false
+	}
+	if decodedSeq > seq {
 		return entry{}, false
 	}
 	return entry{value: node.value, tombstone: node.tombstone}, true

@@ -66,6 +66,21 @@ func main() {
 }
 ```
 
+### Snapshot read
+
+```go
+snap := db.NewSnapshot()
+
+_ = db.Put("key", []byte("v1"))
+_ = db.Put("key", []byte("v2"))
+
+value, err := snap.Get("key")
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(string(value))
+```
+
 ### Custom options
 
 ```go

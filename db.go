@@ -188,9 +188,16 @@ func (db *DB) Get(key string) ([]byte, error) {
 	if key == "" {
 		return nil, errors.New("key required")
 	}
+	return db.GetAt(key, ^uint64(0))
+}
+
+func (db *DB) GetAt(key string, seq uint64) ([]byte, error) {
+	if key == "" {
+		return nil, errors.New("key required")
+	}
 
 	db.mu.RLock()
-	if ent, ok := db.memtable.get(key); ok {
+	if ent, ok := db.memtable.getAt(key, seq); ok {
 		if ent.tombstone {
 			db.mu.RUnlock()
 			return nil, ErrNotFound
@@ -204,7 +211,7 @@ func (db *DB) Get(key string) ([]byte, error) {
 
 	for _, level := range sstables {
 		for i := len(level) - 1; i >= 0; i-- {
-			ent, ok, err := level[i].get(key)
+			ent, ok, err := level[i].getAt(key, seq)
 			if err != nil {
 				return nil, err
 			}
