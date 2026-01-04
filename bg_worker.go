@@ -68,6 +68,10 @@ func (bg *bgWorker) processFlush(task flushTask) {
 		bg.db.logger.Error("flush failed", zap.Error(err))
 		return
 	}
+	if err := bg.db.manifest.AppendAdd(0, id); err != nil {
+		bg.db.logger.Error("manifest append failed", zap.Error(err))
+		return
+	}
 
 	bg.db.mu.Lock()
 	bg.db.sstables[0] = append(bg.db.sstables[0], sst)
@@ -118,6 +122,10 @@ func (bg *bgWorker) processCompaction(level int) {
 		bg.db.logger.Error("compaction failed", zap.Error(err))
 		return
 	}
+	if err := bg.db.manifest.AppendAdd(level+1, id); err != nil {
+		bg.db.logger.Error("manifest append failed", zap.Error(err))
+		return
+	}
 
 	bg.db.mu.Lock()
 	bg.db.sstables[level] = bg.db.compactor.RemoveTables(bg.db.sstables[level], pick)
@@ -128,6 +136,9 @@ func (bg *bgWorker) processCompaction(level int) {
 	for _, sst := range tables {
 		if err := sst.remove(); err != nil {
 			bg.db.logger.Warn("sstable cleanup failed", zap.Error(err))
+		}
+		if err := bg.db.manifest.AppendRemove(sst.level, sst.id); err != nil {
+			bg.db.logger.Warn("manifest remove failed", zap.Error(err))
 		}
 	}
 

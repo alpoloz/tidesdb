@@ -48,6 +48,7 @@ type DB struct {
 	levels    *levelManager
 	meta      *metaStore
 	compactor *compactor
+	manifest  *manifestStore
 }
 
 func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
@@ -83,6 +84,12 @@ func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
 		return nil, err
 	}
 
+	manifest, err := newManifestStore(path)
+	if err != nil {
+		_ = w.Close()
+		return nil, err
+	}
+
 	db := &DB{
 		path:     path,
 		opts:     options,
@@ -90,6 +97,7 @@ func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
 		wal:      w,
 		logger:   logger,
 		sstables: make([][]*sstable, options.MaxLevels),
+		manifest: manifest,
 	}
 
 	db.meta = newMetaStore(path)
@@ -109,10 +117,12 @@ func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
 	}
 	if err := db.loadSSTables(); err != nil {
 		_ = w.Close()
+		_ = manifest.Close()
 		return nil, err
 	}
 	if err := db.walMgr.Replay(); err != nil {
 		_ = w.Close()
+		_ = manifest.Close()
 		return nil, err
 	}
 
@@ -226,7 +236,13 @@ func (db *DB) Close() error {
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.wal.Close()
+	if err := db.wal.Close(); err != nil {
+		return err
+	}
+	if db.manifest != nil {
+		return db.manifest.Close()
+	}
+	return nil
 }
 
 func (db *DB) insertMemtable(key string, ent entry, seq uint64, kind valueKind) {
@@ -275,20 +291,26 @@ func (db *DB) flushLocked() error {
 }
 
 func (db *DB) loadSSTables() error {
-	entries, err := os.ReadDir(db.path)
+	levels, err := db.manifest.Load()
 	if err != nil {
 		return err
 	}
 
-	byLevel := map[int][]uint64{}
-	for _, entry := range entries {
-		level, id, ok := parseSSTableName(entry.Name())
-		if ok {
-			byLevel[level] = append(byLevel[level], id)
+	if len(levels) == 0 {
+		levels, err = db.scanSSTables()
+		if err != nil {
+			return err
+		}
+		for level, ids := range levels {
+			for _, id := range ids {
+				if err := db.manifest.AppendAdd(level, id); err != nil {
+					return err
+				}
+			}
 		}
 	}
 
-	for level, ids := range byLevel {
+	for level, ids := range levels {
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 		db.levels.Ensure(level)
 		for _, id := range ids {
@@ -300,8 +322,23 @@ func (db *DB) loadSSTables() error {
 			db.nextSSTID = max(db.nextSSTID, id+1)
 		}
 	}
-	if len(byLevel) > 0 {
+	if len(levels) > 0 {
 		db.logger.Info("sstables loaded", zap.Int("count", db.levels.Total()))
 	}
 	return nil
+}
+
+func (db *DB) scanSSTables() (map[int][]uint64, error) {
+	entries, err := os.ReadDir(db.path)
+	if err != nil {
+		return nil, err
+	}
+	levels := map[int][]uint64{}
+	for _, entry := range entries {
+		level, id, ok := parseSSTableName(entry.Name())
+		if ok {
+			levels[level] = append(levels[level], id)
+		}
+	}
+	return levels, nil
 }
