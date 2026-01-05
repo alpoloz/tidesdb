@@ -9,7 +9,10 @@ func (db *DB) NewSnapshot() *Snapshot {
 	db.mu.RLock()
 	seq := db.seq
 	db.mu.RUnlock()
-	return &Snapshot{db: db, seq: seq}
+	if db.snapshots == nil {
+		return &Snapshot{db: db, seq: seq}
+	}
+	return db.snapshots.New(db, seq)
 }
 
 func (s *Snapshot) Get(key string) ([]byte, error) {
@@ -24,4 +27,11 @@ func (s *Snapshot) Sequence() uint64 {
 		return 0
 	}
 	return s.seq
+}
+
+func (s *Snapshot) Release() {
+	if s == nil || s.db == nil || s.db.snapshots == nil {
+		return
+	}
+	s.db.snapshots.Release(s)
 }

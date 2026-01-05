@@ -117,7 +117,11 @@ func (bg *bgWorker) processCompaction(level int) {
 		zap.Int("overlaps", len(overlaps)),
 	)
 
-	merged, err := mergeSSTables(bg.db.logger, bg.db.path, level+1, id, tables)
+	minSeq, hasMin := bg.db.snapshots.MinSeq()
+	if !hasMin {
+		minSeq = 0
+	}
+	merged, err := mergeSSTables(bg.db.logger, bg.db.path, level+1, id, tables, minSeq, hasMin)
 	if err != nil {
 		bg.db.logger.Error("compaction failed", zap.Error(err))
 		return

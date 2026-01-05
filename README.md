@@ -70,6 +70,7 @@ func main() {
 
 ```go
 snap := db.NewSnapshot()
+defer snap.Release()
 
 _ = db.Put("key", []byte("v1"))
 _ = db.Put("key", []byte("v2"))

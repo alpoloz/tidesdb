@@ -49,6 +49,7 @@ type DB struct {
 	meta      *metaStore
 	compactor *compactor
 	manifest  *manifestStore
+	snapshots *snapshotManager
 }
 
 func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
@@ -105,6 +106,7 @@ func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
 	db.compactor = newCompactor(db)
 	db.walMgr = newWALManager(db)
 	db.bg = newBackgroundWorker(db)
+	db.snapshots = newSnapshotManager()
 	db.bg.Start()
 
 	if err := db.meta.LoadSeq(db); err != nil {

@@ -250,7 +250,7 @@ func (s *sstable) remove() error {
 	return nil
 }
 
-func mergeSSTables(logger *zap.Logger, dir string, level int, id uint64, tables []*sstable) (*sstable, error) {
+func mergeSSTables(logger *zap.Logger, dir string, level int, id uint64, tables []*sstable, minSeq uint64, hasMin bool) (*sstable, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -265,6 +265,7 @@ func mergeSSTables(logger *zap.Logger, dir string, level int, id uint64, tables 
 	sort.Slice(entries, func(i, j int) bool {
 		return compareInternalKeyStrings(entries[i].key, entries[j].key) < 0
 	})
+	entries = pruneForSnapshots(entries, minSeq, hasMin)
 
 	logger.Info("sstable merge",
 		zap.Uint64("sstable_id", id),
@@ -272,6 +273,51 @@ func mergeSSTables(logger *zap.Logger, dir string, level int, id uint64, tables 
 		zap.Int("entries", len(entries)),
 	)
 	return createSSTable(logger, dir, level, id, entries)
+}
+
+func pruneForSnapshots(entries []sstEntry, minSeq uint64, hasMin bool) []sstEntry {
+	if len(entries) == 0 {
+		return entries
+	}
+	if !hasMin {
+		pruned := make([]sstEntry, 0)
+		var lastUser string
+		for _, item := range entries {
+			userKey, _, _, ok := decodeInternalKey([]byte(item.key))
+			if !ok {
+				continue
+			}
+			if userKey == lastUser {
+				continue
+			}
+			pruned = append(pruned, item)
+			lastUser = userKey
+		}
+		return pruned
+	}
+
+	pruned := make([]sstEntry, 0, len(entries))
+	var currentUser string
+	keptBelow := false
+	for _, item := range entries {
+		userKey, seq, _, ok := decodeInternalKey([]byte(item.key))
+		if !ok {
+			continue
+		}
+		if userKey != currentUser {
+			currentUser = userKey
+			keptBelow = false
+		}
+		if seq >= minSeq {
+			pruned = append(pruned, item)
+			continue
+		}
+		if !keptBelow {
+			pruned = append(pruned, item)
+			keptBelow = true
+		}
+	}
+	return pruned
 }
 
 func parseSSTableName(name string) (int, uint64, bool) {
