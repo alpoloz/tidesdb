@@ -75,6 +75,7 @@ func (bg *bgWorker) processFlush(task flushTask) {
 
 	bg.db.mu.Lock()
 	bg.db.sstables[0] = append(bg.db.sstables[0], sst)
+	bg.db.removePendingFlushLocked(task.walPath)
 	needCompact := len(bg.db.sstables[0]) > bg.db.opts.MaxSSTables
 	bg.db.mu.Unlock()
 
@@ -82,7 +83,9 @@ func (bg *bgWorker) processFlush(task flushTask) {
 		bg.db.logger.Warn("wal cleanup failed", zap.String("path", task.walPath), zap.Error(err))
 	}
 	if needCompact {
-		bg.EnqueueCompaction(0)
+		// Run inline while already on the worker goroutine so shutdown can't
+		// race with a self-enqueue to a closed channel.
+		bg.processCompaction(0)
 	}
 }
 
@@ -92,7 +95,10 @@ func (bg *bgWorker) processCompaction(level int) {
 		bg.db.mu.Unlock()
 		return
 	}
-	bg.db.levels.Ensure(level + 1)
+	if level+1 >= bg.db.opts.MaxLevels || level+1 >= len(bg.db.sstables) {
+		bg.db.mu.Unlock()
+		return
+	}
 	pick := bg.db.compactor.PickInputs(level)
 	if len(pick) == 0 {
 		bg.db.mu.Unlock()
@@ -135,16 +141,16 @@ func (bg *bgWorker) processCompaction(level int) {
 	bg.db.sstables[level] = bg.db.compactor.RemoveTables(bg.db.sstables[level], pick)
 	bg.db.sstables[level+1] = bg.db.compactor.RemoveTables(bg.db.sstables[level+1], overlaps)
 	bg.db.sstables[level+1] = append(bg.db.sstables[level+1], merged)
-	bg.db.mu.Unlock()
-
 	for _, sst := range tables {
+		if err := bg.db.manifest.AppendRemove(sst.level, sst.id); err != nil {
+			bg.db.logger.Warn("manifest remove failed", zap.Error(err))
+			continue
+		}
 		if err := sst.remove(); err != nil {
 			bg.db.logger.Warn("sstable cleanup failed", zap.Error(err))
 		}
-		if err := bg.db.manifest.AppendRemove(sst.level, sst.id); err != nil {
-			bg.db.logger.Warn("manifest remove failed", zap.Error(err))
-		}
 	}
+	bg.db.mu.Unlock()
 
 	bg.db.logger.Info("compaction finished",
 		zap.Int("level", level),

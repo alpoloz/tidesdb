@@ -35,7 +35,9 @@ func (m *memtable) get(userKey string) (entry, bool) {
 }
 
 func (m *memtable) getAt(userKey string, seq uint64) (entry, bool) {
-	seekKey := encodeInternalKey(userKey, seq, valueKindPut)
+	// Seek with the smallest kind at the snapshot sequence so we don't
+	// skip a delete marker that exists at the same sequence number.
+	seekKey := encodeInternalKey(userKey, seq, valueKindDelete)
 	node := m.list.findGreaterOrEqual(seekKey)
 	if node == nil {
 		return entry{}, false

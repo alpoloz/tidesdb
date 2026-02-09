@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 
 	"go.uber.org/zap"
@@ -50,6 +51,12 @@ type DB struct {
 	compactor *compactor
 	manifest  *manifestStore
 	snapshots *snapshotManager
+	pending   []pendingFlush
+}
+
+type pendingFlush struct {
+	entries []sstEntry
+	walPath string
 }
 
 func Open(logger *zap.Logger, path string, opts *Options) (*DB, error) {
@@ -199,17 +206,23 @@ func (db *DB) GetAt(key string, seq uint64) ([]byte, error) {
 	}
 
 	db.mu.RLock()
+	defer db.mu.RUnlock()
 	if ent, ok := db.memtable.getAt(key, seq); ok {
 		if ent.tombstone {
-			db.mu.RUnlock()
 			return nil, ErrNotFound
 		}
 		val := append([]byte(nil), ent.value...)
-		db.mu.RUnlock()
 		return val, nil
 	}
 	sstables := db.levels.Snapshot()
-	db.mu.RUnlock()
+	for i := len(db.pending) - 1; i >= 0; i-- {
+		if ent, ok := getFromEntriesAt(db.pending[i].entries, key, seq); ok {
+			if ent.tombstone {
+				return nil, ErrNotFound
+			}
+			return append([]byte(nil), ent.value...), nil
+		}
+	}
 
 	for _, level := range sstables {
 		for i := len(level) - 1; i >= 0; i-- {
@@ -290,6 +303,7 @@ func (db *DB) flushLocked() error {
 	db.memtable = newMemtable()
 	db.memBytes = 0
 
+	db.pending = append(db.pending, pendingFlush{entries: entries, walPath: rotatedPath})
 	db.bg.EnqueueFlush(entries, rotatedPath)
 
 	if len(db.sstables[0]) > db.opts.MaxSSTables {
@@ -297,6 +311,40 @@ func (db *DB) flushLocked() error {
 	}
 
 	return nil
+}
+
+func (db *DB) removePendingFlushLocked(walPath string) {
+	if len(db.pending) == 0 {
+		return
+	}
+	out := db.pending[:0]
+	for _, p := range db.pending {
+		if p.walPath == walPath {
+			continue
+		}
+		out = append(out, p)
+	}
+	db.pending = out
+}
+
+func getFromEntriesAt(entries []sstEntry, key string, seq uint64) (entry, bool) {
+	for _, item := range entries {
+		userKey, recSeq, _, ok := decodeInternalKey([]byte(item.key))
+		if !ok {
+			continue
+		}
+		cmp := strings.Compare(userKey, key)
+		if cmp < 0 {
+			continue
+		}
+		if cmp > 0 {
+			return entry{}, false
+		}
+		if recSeq <= seq {
+			return item.entry, true
+		}
+	}
+	return entry{}, false
 }
 
 func (db *DB) loadSSTables() error {
@@ -320,6 +368,9 @@ func (db *DB) loadSSTables() error {
 	}
 
 	for level, ids := range levels {
+		if level < 0 || level >= db.opts.MaxLevels {
+			return fmt.Errorf("sstable level %d exceeds MaxLevels %d", level, db.opts.MaxLevels)
+		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 		db.levels.Ensure(level)
 		for _, id := range ids {

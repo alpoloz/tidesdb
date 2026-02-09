@@ -194,50 +194,56 @@ func (s *sstable) getAt(key string, seq uint64) (entry, bool, error) {
 	if len(s.index) == 0 {
 		return entry{}, false, nil
 	}
-	seekKey := encodeInternalKey(key, seq, valueKindPut)
+	// Use the smallest kind to avoid skipping a same-sequence tombstone.
+	seekKey := encodeInternalKey(key, seq, valueKindDelete)
 	pos := sort.Search(len(s.index), func(i int) bool {
 		return compareInternalKeyStrings(s.index[i].firstKey, string(seekKey)) > 0
 	})
-	blockIdx := pos - 1
-	if blockIdx < 0 {
-		return entry{}, false, nil
+	startBlock := pos - 1
+	if startBlock < 0 {
+		// The target may still live in the first block if seekKey is before
+		// the table's first key (for example latest-seq lookup on that key).
+		startBlock = 0
 	}
-	offset := s.index[blockIdx].offset
 	file, err := os.Open(s.dataPath)
 	if err != nil {
 		return entry{}, false, err
 	}
 	defer file.Close()
-	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		return entry{}, false, err
-	}
-	var blockLen uint32
-	if err := binary.Read(file, binary.LittleEndian, &blockLen); err != nil {
-		return entry{}, false, err
-	}
-	block := make([]byte, blockLen)
-	if _, err := io.ReadFull(file, block); err != nil {
-		return entry{}, false, err
-	}
-	reader := bytes.NewReader(block)
-	for reader.Len() > 0 {
-		recKey, ent, _, err := s.readRecord(reader)
-		if err != nil {
+
+	for blockIdx := startBlock; blockIdx < len(s.index); blockIdx++ {
+		offset := s.index[blockIdx].offset
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
 			return entry{}, false, err
 		}
-		userKey, recSeq, _, ok := decodeInternalKey([]byte(recKey))
-		if !ok {
-			continue
+		var blockLen uint32
+		if err := binary.Read(file, binary.LittleEndian, &blockLen); err != nil {
+			return entry{}, false, err
 		}
-		cmp := strings.Compare(userKey, key)
-		if cmp == 0 {
-			if recSeq <= seq {
-				return ent, true, nil
+		block := make([]byte, blockLen)
+		if _, err := io.ReadFull(file, block); err != nil {
+			return entry{}, false, err
+		}
+		reader := bytes.NewReader(block)
+		for reader.Len() > 0 {
+			recKey, ent, _, err := s.readRecord(reader)
+			if err != nil {
+				return entry{}, false, err
 			}
-			continue
-		}
-		if cmp > 0 {
-			return entry{}, false, nil
+			userKey, recSeq, _, ok := decodeInternalKey([]byte(recKey))
+			if !ok {
+				continue
+			}
+			cmp := strings.Compare(userKey, key)
+			if cmp == 0 {
+				if recSeq <= seq {
+					return ent, true, nil
+				}
+				continue
+			}
+			if cmp > 0 {
+				return entry{}, false, nil
+			}
 		}
 	}
 	return entry{}, false, nil
