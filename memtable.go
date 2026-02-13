@@ -2,6 +2,9 @@ package tidesdb
 
 import (
 	"bytes"
+	"sync/atomic"
+	"time"
+	"unsafe"
 )
 
 const (
@@ -13,6 +16,8 @@ type memtable struct {
 	list  *skiplist
 	arena *arena
 }
+
+var skiplistSeed = uint64(time.Now().UnixNano())
 
 func newMemtable() *memtable {
 	return &memtable{
@@ -57,7 +62,7 @@ func (m *memtable) len() int {
 }
 
 func (m *memtable) bytesUsed() int {
-	return m.arena.used()
+	return m.arena.used() + m.list.bytesUsed()
 }
 
 func (m *memtable) entries() []sstEntry {
@@ -115,12 +120,13 @@ func (a *arena) used() int {
 }
 
 type skiplist struct {
-	head      *skiplistNode
-	maxHeight int
-	height    int
-	rnd       uint32
-	length    int
-	compare   func(a, b []byte) int
+	head       *skiplistNode
+	maxHeight  int
+	height     int
+	rnd        uint32
+	length     int
+	allocBytes int
+	compare    func(a, b []byte) int
 }
 
 type skiplistNode struct {
@@ -138,25 +144,22 @@ func newSkiplist(maxHeight int, compare func(a, b []byte) int) *skiplist {
 		compare = bytes.Compare
 	}
 	head := &skiplistNode{next: make([]*skiplistNode, maxHeight)}
-	return &skiplist{head: head, maxHeight: maxHeight, height: 1, rnd: 0xdeadbeef, compare: compare}
+	return &skiplist{
+		head:       head,
+		maxHeight:  maxHeight,
+		height:     1,
+		rnd:        nextSkiplistSeed(),
+		allocBytes: nodeAllocBytes(maxHeight),
+		compare:    compare,
+	}
 }
 
 func (s *skiplist) len() int {
 	return s.length
 }
 
-func (s *skiplist) find(key []byte) *skiplistNode {
-	x := s.head
-	for level := s.height - 1; level >= 0; level-- {
-		for next := x.next[level]; next != nil && s.compare(next.key, key) < 0; next = x.next[level] {
-			x = next
-		}
-	}
-	x = x.next[0]
-	if x != nil && s.compare(x.key, key) == 0 {
-		return x
-	}
-	return nil
+func (s *skiplist) bytesUsed() int {
+	return s.allocBytes
 }
 
 func (s *skiplist) findGreaterOrEqual(key []byte) *skiplistNode {
@@ -170,7 +173,18 @@ func (s *skiplist) findGreaterOrEqual(key []byte) *skiplistNode {
 }
 
 func (s *skiplist) insertOrUpdate(key []byte, value []byte, tombstone bool) {
-	update := make([]*skiplistNode, s.maxHeight)
+	var update []*skiplistNode
+	if s.maxHeight <= defaultSkiplistHeight {
+		var updateStack [defaultSkiplistHeight]*skiplistNode
+		update = updateStack[:s.maxHeight]
+		s.insertOrUpdateWithUpdate(update, key, value, tombstone)
+		return
+	}
+	update = make([]*skiplistNode, s.maxHeight)
+	s.insertOrUpdateWithUpdate(update, key, value, tombstone)
+}
+
+func (s *skiplist) insertOrUpdateWithUpdate(update []*skiplistNode, key []byte, value []byte, tombstone bool) {
 	x := s.head
 	for level := s.height - 1; level >= 0; level-- {
 		for next := x.next[level]; next != nil && s.compare(next.key, key) < 0; next = x.next[level] {
@@ -204,6 +218,7 @@ func (s *skiplist) insertOrUpdate(key []byte, value []byte, tombstone bool) {
 		update[level].next[level] = node
 	}
 	s.length++
+	s.allocBytes += nodeAllocBytes(nodeHeight)
 }
 
 func (s *skiplist) randomHeight() int {
@@ -217,4 +232,22 @@ func (s *skiplist) randomHeight() int {
 func (s *skiplist) rand() uint32 {
 	s.rnd = s.rnd*1664525 + 1013904223
 	return s.rnd
+}
+
+func nextSkiplistSeed() uint32 {
+	v := atomic.AddUint64(&skiplistSeed, 0x9e3779b97f4a7c15)
+	v ^= v >> 30
+	v *= 0xbf58476d1ce4e5b9
+	v ^= v >> 27
+	v *= 0x94d049bb133111eb
+	v ^= v >> 31
+	seed := uint32(v)
+	if seed == 0 {
+		return 0x9e3779b9
+	}
+	return seed
+}
+
+func nodeAllocBytes(height int) int {
+	return int(unsafe.Sizeof(skiplistNode{})) + height*int(unsafe.Sizeof((*skiplistNode)(nil)))
 }

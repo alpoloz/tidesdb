@@ -6,12 +6,13 @@ Simple, persistent key-value store powered by an LSM-tree architecture. Designed
 
 This implementation mirrors the core LSM flow while keeping the code intentionally small and readable.
 
-1. **WAL (write-ahead log)**: Every `Put` and `Delete` is appended to `wal.log` before touching memory. On restart, the WAL is replayed to rebuild the memtable.
-2. **Memtable**: In-memory map storing the latest key state (value or tombstone). When it grows beyond a threshold, it is flushed to disk.
-3. **SSTables**: Immutable sorted tables on disk (`sst_*.dat`) with a simple in-memory index (`sst_*.idx`) mapping keys to offsets for point lookups.
-4. **Compaction**: When the number of SSTables exceeds the configured limit, tables are merged into one new SSTable, preserving the newest value and discarding tombstones.
+1. **WAL (write-ahead log)**: Every `Put` and `Delete` is appended to `wal.log` (with `fsync`) before touching memory. During flush, `wal.log` is rotated (`wal_*.log`) and replay on startup loads all WAL files in order.
+2. **Memtable**: In-memory skiplist (ordered by internal key: user key + sequence + kind) backed by an arena allocator for key/value bytes. This preserves sorted order for flush and supports snapshot reads.
+3. **SSTables**: Immutable sorted tables on disk (`sst_L<level>_<id>.dat`). Each file embeds block data, block index, bloom filter, and metaindex/footer; index and bloom are loaded in memory for point lookups.
+4. **Compaction**: Leveled, overlap-aware compaction. A picker chooses input table(s) from one level plus overlapping tables from the next level, then merges and prunes old versions/tombstones with snapshot awareness.
+5. **Manifest**: A durable append-only `MANIFEST` tracks table add/remove events so startup can rebuild level state without relying on directory scans.
 
-Data lookup order is memtable -> newest SSTable -> oldest SSTable.
+Data lookup order is memtable -> pending flush batches -> SSTables (newest to oldest within each level).
 
 ## Features
 
